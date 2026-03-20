@@ -6,3 +6,4 @@ DerivedData/
 .swiftpm/
 *.xcodeproj
 .env
+CLAUDE.md
