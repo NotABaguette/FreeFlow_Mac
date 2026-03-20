@@ -111,7 +111,7 @@ struct ChatView: View {
             } label: {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: 28))
-                    .foregroundStyle(messageText.isEmpty ? .tertiary : .blue)
+                    .foregroundColor(messageText.isEmpty ? .gray : .blue)
             }
             .buttonStyle(.plain)
             .disabled(messageText.isEmpty)
