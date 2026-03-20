@@ -1,8 +1,9 @@
 import SwiftUI
 
-/// Connection management: connect, ping, DNS cache test, session info, live log
+/// Connection management: connect, ping, sync inbox, DNS cache test, transport toggle, logs
 struct ConnectionPanel: View {
     @EnvironmentObject var state: AppState
+    @State private var logTab = 0  // 0=connection log, 1=dev query log
 
     var body: some View {
         ScrollView {
@@ -18,6 +19,12 @@ struct ConnectionPanel: View {
                                 .font(.system(.title3, design: .monospaced))
                                 .fontWeight(.semibold)
                             Spacer()
+                            Text(state.useRelayHTTP ? "HTTP Relay" : "DNS Transport")
+                                .font(.system(.caption, design: .monospaced))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(state.useRelayHTTP ? Color.orange.opacity(0.2) : Color.cyan.opacity(0.2))
+                                .cornerRadius(4)
                         }
 
                         HStack(spacing: 20) {
@@ -36,7 +43,7 @@ struct ConnectionPanel: View {
                 // Actions
                 GroupBox {
                     VStack(spacing: 10) {
-                        HStack(spacing: 10) {
+                        HStack(spacing: 8) {
                             Button {
                                 if state.connectionState == .connected {
                                     state.disconnect()
@@ -64,6 +71,16 @@ struct ConnectionPanel: View {
                             .buttonStyle(.bordered)
 
                             Button {
+                                state.syncInbox()
+                            } label: {
+                                Label("Sync Inbox", systemImage: "envelope.arrow.triangle.branch")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .controlSize(.large)
+                            .buttonStyle(.bordered)
+                            .disabled(!state.sessionActive)
+
+                            Button {
                                 state.testDNSCache()
                             } label: {
                                 Label("Cache Test", systemImage: "cylinder")
@@ -73,19 +90,36 @@ struct ConnectionPanel: View {
                             .buttonStyle(.bordered)
                         }
 
-                        // Connection config
+                        // Transport + config
                         HStack {
                             LabeledContent("Resolver") {
                                 TextField("8.8.8.8", text: $state.resolverAddress)
                                     .textFieldStyle(.roundedBorder)
                                     .font(.system(.body, design: .monospaced))
-                                    .frame(width: 180)
+                                    .frame(width: 150)
                             }
                             LabeledContent("Domain") {
                                 TextField("cdn-static-eu.net", text: $state.oracleDomain)
                                     .textFieldStyle(.roundedBorder)
                                     .font(.system(.body, design: .monospaced))
-                                    .frame(width: 200)
+                                    .frame(width: 180)
+                            }
+                        }
+
+                        // Transport toggle
+                        HStack {
+                            Picker("Transport", selection: $state.useRelayHTTP) {
+                                Text("DNS AAAA").tag(false)
+                                Text("HTTP Relay").tag(true)
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(width: 250)
+
+                            if state.useRelayHTTP {
+                                TextField("Relay URL", text: $state.relayURL)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .frame(width: 250)
                             }
                         }
                     }
@@ -102,50 +136,113 @@ struct ConnectionPanel: View {
                             InfoRow(label: "Key Exchange", value: "X25519 ECDH")
                             InfoRow(label: "Key Derivation", value: "HKDF-SHA256")
                             InfoRow(label: "Token Rotation", value: "HMAC-SHA256 per query")
-                            InfoRow(label: "Transport", value: "DNS AAAA (IPv6)")
+                            InfoRow(label: "Transport", value: state.useRelayHTTP ? "HTTP Relay" : "DNS AAAA (IPv6)")
                         }
                     } label: {
                         Label("Session", systemImage: "lock.fill")
                     }
                 }
 
-                // Connection log
+                // Log tabs
                 GroupBox {
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            LazyVStack(alignment: .leading, spacing: 2) {
-                                ForEach(state.connectionLog) { entry in
-                                    HStack(spacing: 6) {
-                                        Text(entry.timestamp, style: .time)
-                                            .foregroundStyle(.tertiary)
-                                            .frame(width: 70, alignment: .leading)
-                                        Text(entry.level.icon)
-                                            .foregroundStyle(entry.level.color)
-                                            .frame(width: 14)
-                                        Text(entry.message)
-                                            .foregroundStyle(entry.level.color.opacity(0.8))
-                                    }
-                                    .font(.system(.caption, design: .monospaced))
-                                    .id(entry.id)
-                                }
+                    VStack(spacing: 0) {
+                        Picker("Log", selection: $logTab) {
+                            Text("Connection Log").tag(0)
+                            if state.devMode {
+                                Text("Dev Query Log (\(state.devQueryLog.count))").tag(1)
                             }
-                            .padding(8)
                         }
-                        .frame(minHeight: 200, maxHeight: 400)
-                        .onChange(of: state.connectionLog.count) { _, _ in
-                            if let last = state.connectionLog.last {
-                                proxy.scrollTo(last.id, anchor: .bottom)
-                            }
+                        .pickerStyle(.segmented)
+                        .padding(.bottom, 8)
+
+                        if logTab == 0 {
+                            connectionLogView
+                        } else {
+                            devQueryLogView
                         }
                     }
-                    .background(.black.opacity(0.3))
-                    .cornerRadius(6)
                 } label: {
-                    Label("Connection Log", systemImage: "text.justify.left")
+                    Label("Logs", systemImage: "text.justify.left")
                 }
             }
             .padding()
         }
+    }
+
+    private var connectionLogView: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    ForEach(state.connectionLog) { entry in
+                        HStack(spacing: 6) {
+                            Text(entry.timestamp.formatted(.dateTime.hour().minute().second()))
+                                .foregroundColor(Color(nsColor: .tertiaryLabelColor))
+                                .frame(width: 70, alignment: .leading)
+                            Text(entry.level.icon)
+                                .foregroundColor(entry.level.color)
+                                .frame(width: 14)
+                            Text(entry.message)
+                                .foregroundColor(entry.level == .info ?
+                                    Color(nsColor: .labelColor) : entry.level.color)
+                        }
+                        .font(.system(.caption, design: .monospaced))
+                        .id(entry.id)
+                    }
+                }
+                .padding(8)
+            }
+            .frame(minHeight: 200, maxHeight: 400)
+            .background(Color(nsColor: .textBackgroundColor).opacity(0.5))
+            .cornerRadius(6)
+            .onChange(of: state.connectionLog.count) { _, _ in
+                if let last = state.connectionLog.last {
+                    proxy.scrollTo(last.id, anchor: .bottom)
+                }
+            }
+        }
+    }
+
+    private var devQueryLogView: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 4) {
+                ForEach(state.devQueryLog) { entry in
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text(entry.timestamp.formatted(.dateTime.hour().minute().second()))
+                                .foregroundColor(Color(nsColor: .tertiaryLabelColor))
+                            Text("[\(entry.transport)]")
+                                .foregroundColor(.purple)
+                            Text(entry.domain)
+                                .foregroundColor(.cyan)
+                        }
+                        .font(.system(.caption2, design: .monospaced))
+
+                        HStack(spacing: 4) {
+                            Text("Q:")
+                                .foregroundColor(.orange)
+                            Text(entry.query)
+                                .foregroundColor(Color(nsColor: .labelColor))
+                        }
+                        .font(.system(.caption, design: .monospaced))
+
+                        HStack(spacing: 4) {
+                            Text("R:")
+                                .foregroundColor(.green)
+                            Text(entry.response)
+                                .foregroundColor(Color(nsColor: .labelColor))
+                        }
+                        .font(.system(.caption, design: .monospaced))
+                    }
+                    .padding(6)
+                    .background(Color(nsColor: .controlBackgroundColor))
+                    .cornerRadius(4)
+                }
+            }
+            .padding(8)
+        }
+        .frame(minHeight: 200, maxHeight: 400)
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.5))
+        .cornerRadius(6)
     }
 }
 
@@ -164,7 +261,7 @@ struct StatBox: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 6)
-        .background(.quaternary.opacity(0.3))
+        .background(Color(nsColor: .controlBackgroundColor))
         .cornerRadius(6)
     }
 }
@@ -181,7 +278,7 @@ struct InfoRow: View {
                 .frame(width: 120, alignment: .leading)
             Text(value)
                 .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(.green)
+                .foregroundColor(.green)
         }
     }
 }

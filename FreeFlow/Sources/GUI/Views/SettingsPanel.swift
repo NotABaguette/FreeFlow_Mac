@@ -43,6 +43,19 @@ struct SettingsPanel: View {
                 }
             }
 
+            Section("Transport") {
+                Picker("Mode", selection: $state.useRelayHTTP) {
+                    Text("DNS AAAA (covert)").tag(false)
+                    Text("HTTP Relay (faster)").tag(true)
+                }
+                if state.useRelayHTTP {
+                    TextField("Relay URL", text: $state.relayURL)
+                        .font(.system(.body, design: .monospaced))
+                    TextField("API Key", text: $state.relayAPIKey)
+                        .font(.system(.body, design: .monospaced))
+                }
+            }
+
             Section("Connection") {
                 Toggle("Auto-reconnect", isOn: $state.autoReconnect)
             }
@@ -131,10 +144,19 @@ struct SettingsPanel: View {
                 }
             }
 
+            Section("Developer") {
+                Toggle("Dev Mode (log all queries)", isOn: $state.devMode)
+                if state.devMode {
+                    Text("Every DNS query and response will be logged in Connection → Dev Query Log tab.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Section("About") {
                 InfoRow(label: "Version", value: "1.0.0")
                 InfoRow(label: "Protocol", value: "FreeFlow v2")
-                InfoRow(label: "Transport", value: "DNS AAAA")
+                InfoRow(label: "Transport", value: state.useRelayHTTP ? "HTTP Relay" : "DNS AAAA")
             }
         }
     }

@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Main three-column layout: sidebar, chat list, chat view
+/// Main layout: sidebar + detail
 struct MainView: View {
     @EnvironmentObject var state: AppState
     @State private var selectedTab: SidebarTab = .chats
@@ -8,6 +8,7 @@ struct MainView: View {
     enum SidebarTab: String, CaseIterable {
         case chats = "Chats"
         case contacts = "Contacts"
+        case bulletins = "Bulletins"
         case connection = "Connection"
         case identity = "Identity"
     }
@@ -28,18 +29,24 @@ struct MainView: View {
                     Text(state.connectionState.rawValue)
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.secondary)
-                    if state.queryCount > 0 {
-                        Text("| \(state.queryCount) queries")
+                    Text("| \(state.queryCount)q")
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    if state.useRelayHTTP {
+                        Text("| HTTP")
                             .font(.system(.caption2, design: .monospaced))
-                            .foregroundStyle(.tertiary)
+                            .foregroundColor(.orange)
+                    }
+                    if state.devMode {
+                        Text("| DEV")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundColor(.purple)
                     }
                 }
             }
         }
         .onAppear {
-            if !state.hasIdentity {
-                selectedTab = .identity
-            }
+            if !state.hasIdentity { selectedTab = .identity }
         }
     }
 
@@ -57,14 +64,11 @@ struct MainView: View {
     @ViewBuilder
     private var detailView: some View {
         switch selectedTab {
-        case .chats:
-            ChatListView()
-        case .contacts:
-            ContactsPanel()
-        case .connection:
-            ConnectionPanel()
-        case .identity:
-            IdentityPanel()
+        case .chats: ChatListView()
+        case .contacts: ContactsPanel()
+        case .bulletins: BulletinPanel()
+        case .connection: ConnectionPanel()
+        case .identity: IdentityPanel()
         }
     }
 
@@ -72,15 +76,15 @@ struct MainView: View {
         switch tab {
         case .chats: return "bubble.left.and.bubble.right"
         case .contacts: return "person.2"
+        case .bulletins: return "megaphone"
         case .connection: return "antenna.radiowaves.left.and.right"
         case .identity: return "person.crop.circle"
         }
     }
 
     private func badgeFor(_ tab: SidebarTab) -> Int {
-        if tab == .chats {
-            return state.unreadCounts.values.reduce(0, +)
-        }
+        if tab == .chats { return state.unreadCounts.values.reduce(0, +) }
+        if tab == .bulletins { return state.bulletins.isEmpty ? 0 : 0 }
         return 0
     }
 }

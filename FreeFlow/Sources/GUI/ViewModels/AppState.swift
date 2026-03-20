@@ -37,6 +37,14 @@ class AppState: ObservableObject {
     @Published var dailyBudget: Int = 300
     @Published var useDNSOverHTTPS: Bool = false
 
+    // Dev mode
+    @Published var devMode: Bool = false
+    @Published var devQueryLog: [QueryLogEntry] = []
+
+    // Bulletins
+    @Published var bulletins: [Bulletin] = []
+    @Published var lastBulletinID: UInt16 = 0
+
     // Connection log
     @Published var connectionLog: [LogEntry] = []
 
@@ -233,6 +241,90 @@ class AppState: ObservableObject {
         }
     }
 
+    // MARK: - Sync Inbox
+
+    func syncInbox() {
+        guard sessionActive else {
+            log(.warning, "Cannot sync — no active session")
+            return
+        }
+        log(.dns, "GET_MSG → polling inbox...")
+        queryCount += 1
+        devLog(query: "GET_MSG poll", response: "waiting...")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            let hasMessages = Bool.random()
+            if hasMessages {
+                let sampleSenders = self.contacts.prefix(2)
+                for contact in sampleSenders {
+                    let msgs = ["Are you safe?", "Check the bulletin", "Network is back in some areas",
+                                "Meeting at usual place", "Send update when you can"]
+                    let msg = msgs.randomElement()!
+                    self.receiveMessage(msg, from: contact)
+                    self.log(.success, "Message from \(contact.displayName): \(msg)")
+                    self.devLog(query: "GET_MSG", response: "fragment: \(msg.count)B from \(contact.fingerprintHex.prefix(8))")
+                }
+            } else {
+                self.log(.info, "Inbox empty — no new messages")
+                self.devLog(query: "GET_MSG", response: "empty (0 bytes)")
+            }
+        }
+    }
+
+    // MARK: - Bulletins
+
+    func fetchBulletin() {
+        log(.dns, "GET_BULLETIN → fetching latest...")
+        queryCount += 1
+        devLog(query: "GET_BULLETIN (lastID=\(lastBulletinID))", response: "waiting...")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            self.lastBulletinID += 1
+            let sampleBulletins = [
+                "Internet access partially restored in western provinces. Satellite uplinks operational.",
+                "Emergency coordination channel active. Use DGA epoch 3 domains.",
+                "All proxy shields rotated. New NS records propagating. ETA 6 hours.",
+                "Confirmed: DNS filtering bypass effective on resolvers 8.8.8.8 and 1.1.1.1.",
+                "Security advisory: update to epoch seed 4. Old seeds compromised.",
+            ]
+            let content = sampleBulletins.randomElement()!
+            let bulletin = Bulletin(
+                id: self.lastBulletinID,
+                timestamp: Date(),
+                content: content,
+                verified: true,
+                signatureHex: String((0..<16).map { _ in "0123456789abcdef".randomElement()! })
+            )
+            self.bulletins.insert(bulletin, at: 0)
+            self.log(.success, "Bulletin #\(bulletin.id) received (\(content.count) chars, signature verified)")
+            self.devLog(query: "GET_BULLETIN", response: "id=\(bulletin.id) len=\(content.count) sig=OK")
+
+            if self.bulletins.count > 50 { self.bulletins = Array(self.bulletins.prefix(50)) }
+        }
+    }
+
+    // MARK: - Dev Query Logging
+
+    func devLog(query: String, response: String) {
+        guard devMode else { return }
+        let entry = QueryLogEntry(
+            timestamp: Date(),
+            query: query,
+            response: response,
+            domain: oracleDomain,
+            resolver: resolverAddress,
+            transport: useRelayHTTP ? "HTTP Relay" : "DNS AAAA"
+        )
+        devQueryLog.append(entry)
+        if devQueryLog.count > 500 { devQueryLog.removeFirst(100) }
+    }
+
+    // MARK: - Transport
+
+    @Published var useRelayHTTP: Bool = false
+    @Published var relayURL: String = "https://oracle.example.com:8443"
+    @Published var relayAPIKey: String = ""
+
     // MARK: - Settings
 
     func saveSettings() {
@@ -245,6 +337,10 @@ class AppState: ObservableObject {
             "queryInterval": queryInterval,
             "dailyBudget": dailyBudget,
             "doh": useDNSOverHTTPS,
+            "devMode": devMode,
+            "useRelayHTTP": useRelayHTTP,
+            "relayURL": relayURL,
+            "relayAPIKey": relayAPIKey,
         ]
         let url = dataDir.appendingPathComponent("settings.json")
         if let data = try? JSONSerialization.data(withJSONObject: settings, options: .prettyPrinted) {
@@ -264,6 +360,10 @@ class AppState: ObservableObject {
         queryInterval = dict["queryInterval"] as? Double ?? 5.0
         dailyBudget = dict["dailyBudget"] as? Int ?? 300
         useDNSOverHTTPS = dict["doh"] as? Bool ?? false
+        devMode = dict["devMode"] as? Bool ?? false
+        useRelayHTTP = dict["useRelayHTTP"] as? Bool ?? false
+        relayURL = dict["relayURL"] as? String ?? relayURL
+        relayAPIKey = dict["relayAPIKey"] as? String ?? ""
     }
 
     // MARK: - Logging
@@ -333,11 +433,29 @@ enum LogLevel {
 
     var color: Color {
         switch self {
-        case .info: return .secondary
-        case .dns: return .blue
+        case .info: return Color(nsColor: .secondaryLabelColor)
+        case .dns: return .cyan
         case .success: return .green
         case .warning: return .orange
         case .error: return .red
         }
     }
+}
+
+struct Bulletin: Identifiable {
+    let id: UInt16
+    let timestamp: Date
+    let content: String
+    let verified: Bool
+    let signatureHex: String
+}
+
+struct QueryLogEntry: Identifiable {
+    let id = UUID()
+    let timestamp: Date
+    let query: String
+    let response: String
+    let domain: String
+    let resolver: String
+    let transport: String
 }
