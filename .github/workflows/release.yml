@@ -36,8 +36,7 @@ jobs:
             -derivedDataPath build/arm64 \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            | xcpretty || true
+            CODE_SIGNING_ALLOWED=NO
 
       - name: Build GUI (x86_64)
         run: |
@@ -49,46 +48,40 @@ jobs:
             -derivedDataPath build/x86_64 \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            | xcpretty || true
+            CODE_SIGNING_ALLOWED=NO
 
-      - name: Create Universal App + CLI
+      - name: Package release
         run: |
           VERSION=${GITHUB_REF_NAME}
           mkdir -p release
 
-          ARM64_APP="build/arm64/Build/Products/Release/FreeFlow.app"
-          X86_APP="build/x86_64/Build/Products/Release/FreeFlow.app"
+          ARM64_APP=$(find build/arm64 -name "FreeFlow.app" -type d | head -1)
+          X86_APP=$(find build/x86_64 -name "FreeFlow.app" -type d | head -1)
 
-          # Universal .app
-          if [ -d "$ARM64_APP" ] && [ -d "$X86_APP" ]; then
+          if [ -n "$ARM64_APP" ] && [ -n "$X86_APP" ]; then
             cp -R "$ARM64_APP" "release/FreeFlow.app"
             lipo -create \
               "$ARM64_APP/Contents/MacOS/FreeFlow" \
               "$X86_APP/Contents/MacOS/FreeFlow" \
               -output "release/FreeFlow.app/Contents/MacOS/FreeFlow"
-          elif [ -d "$ARM64_APP" ]; then
+          elif [ -n "$ARM64_APP" ]; then
             cp -R "$ARM64_APP" "release/FreeFlow.app"
           fi
 
-          # ZIP the app
           cd release
           ditto -c -k --sequesterRsrc --keepParent FreeFlow.app "FreeFlow-${VERSION}-macOS-universal.zip"
           rm -rf FreeFlow.app
           cd ..
 
-          # CLI binary
           swift build -c release
           cp .build/release/freeflow release/
           cd release
           tar czf "freeflow-cli-${VERSION}-macOS.tar.gz" freeflow
           rm freeflow
-
-          # Source
           cd ..
+
           git archive --format=tar.gz --prefix=FreeFlow-Mac-${VERSION}/ HEAD > "release/source-${VERSION}.tar.gz"
 
-          # Checksums
           cd release && shasum -a 256 *.tar.gz *.zip > checksums.txt
 
       - name: Create GitHub Release
@@ -103,15 +96,8 @@ jobs:
             - **FreeFlow-${{ github.ref_name }}-macOS-universal.zip** — GUI app (ARM64 + Intel)
             - **freeflow-cli-${{ github.ref_name }}-macOS.tar.gz** — CLI tool
 
-            ### Install GUI
-            1. Download the `.zip` file
+            ### Install
+            1. Download the `.zip`
             2. Unzip → drag `FreeFlow.app` to `/Applications`
-            3. Right-click → Open (first launch, to bypass Gatekeeper)
-
-            ### Install CLI
-            ```bash
-            tar xzf freeflow-cli-*.tar.gz
-            sudo mv freeflow /usr/local/bin/
-            freeflow test
-            ```
+            3. Right-click → Open (first launch)
           draft: false
