@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "FreeFlow",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v14)],
     products: [
         .library(name: "FreeFlowCore", targets: ["FreeFlowCore"]),
         .executable(name: "freeflow", targets: ["FreeFlowCLI"]),
@@ -17,7 +17,7 @@ let package = Package(
         .executableTarget(
             name: "FreeFlowCLI",
             dependencies: ["FreeFlowCore"],
-            path: "FreeFlow/Sources/App"
+            path: "FreeFlow/Sources/CLI"
         ),
         .testTarget(
             name: "FreeFlowTests",
