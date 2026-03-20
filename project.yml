@@ -1,0 +1,54 @@
+name: FreeFlow
+options:
+  bundleIdPrefix: com.freeflow
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGNING_ALLOWED: "NO"
+
+targets:
+  FreeFlow:
+    type: application
+    platform: macOS
+    sources:
+      - path: FreeFlow/Sources/GUI
+      - path: FreeFlow/Sources/Core
+    info:
+      path: FreeFlow/Sources/GUI/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.freeflow.mac
+        PRODUCT_NAME: FreeFlow
+        GENERATE_INFOPLIST_FILE: false
+        INFOPLIST_FILE: FreeFlow/Sources/GUI/Info.plist
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        COMBINE_HIDPI_IMAGES: true
+
+  FreeFlowCLI:
+    type: tool
+    platform: macOS
+    sources:
+      - path: FreeFlow/Sources/CLI
+      - path: FreeFlow/Sources/Core
+    settings:
+      base:
+        PRODUCT_NAME: freeflow
+
+  FreeFlowTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: FreeFlow/Tests
+    dependencies:
+      - target: FreeFlow
+    settings:
+      base:
+        PRODUCT_NAME: FreeFlowTests

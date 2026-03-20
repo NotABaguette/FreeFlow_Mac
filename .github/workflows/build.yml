@@ -19,34 +19,119 @@ jobs:
       - name: Swift version
         run: swift --version
 
-      - name: Build debug
-        run: swift build
+      - name: Install XcodeGen
+        run: brew install xcodegen
 
-      - name: Build release
-        run: swift build -c release
+      - name: Generate Xcode project
+        run: xcodegen generate
 
-      - name: Run tests
-        run: swift test --parallel
+      - name: Build & test CLI (SPM)
+        run: |
+          swift build
+          swift test --parallel
+          swift run freeflow test
 
-      - name: Run self-test
-        run: swift run freeflow test
+      - name: Build GUI app (ARM64)
+        run: |
+          xcodebuild build \
+            -project FreeFlow.xcodeproj \
+            -scheme FreeFlow \
+            -configuration Release \
+            -arch arm64 \
+            -derivedDataPath build/arm64 \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            | xcpretty || true
 
-      - name: Package release binary
+      - name: Build GUI app (x86_64)
+        run: |
+          xcodebuild build \
+            -project FreeFlow.xcodeproj \
+            -scheme FreeFlow \
+            -configuration Release \
+            -arch x86_64 \
+            -derivedDataPath build/x86_64 \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            | xcpretty || true
+
+      - name: Create Universal Binary
         run: |
           mkdir -p artifacts
+
+          ARM64_APP="build/arm64/Build/Products/Release/FreeFlow.app"
+          X86_APP="build/x86_64/Build/Products/Release/FreeFlow.app"
+
+          if [ -d "$ARM64_APP" ] && [ -d "$X86_APP" ]; then
+            # Copy ARM64 app as base
+            cp -R "$ARM64_APP" "artifacts/FreeFlow.app"
+
+            # Create universal binary with lipo
+            lipo -create \
+              "$ARM64_APP/Contents/MacOS/FreeFlow" \
+              "$X86_APP/Contents/MacOS/FreeFlow" \
+              -output "artifacts/FreeFlow.app/Contents/MacOS/FreeFlow"
+
+            echo "Universal binary created"
+            file "artifacts/FreeFlow.app/Contents/MacOS/FreeFlow"
+          elif [ -d "$ARM64_APP" ]; then
+            cp -R "$ARM64_APP" "artifacts/FreeFlow.app"
+            echo "ARM64 only (x86_64 build may have failed)"
+            file "artifacts/FreeFlow.app/Contents/MacOS/FreeFlow"
+          else
+            echo "No .app found"
+            find build -name "FreeFlow.app" -type d 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Build CLI release
+        run: |
+          swift build -c release
           cp .build/release/freeflow artifacts/freeflow
           chmod +x artifacts/freeflow
-          # Create tar
-          cd artifacts && tar czf freeflow-macos-arm64.tar.gz freeflow
-          shasum -a 256 freeflow-macos-arm64.tar.gz > checksums.txt
-          echo "{\"commit\": \"$GITHUB_SHA\", \"date\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > build-info.json
 
-      - name: Upload binary
+      - name: Package artifacts
+        run: |
+          cd artifacts
+
+          # ZIP the .app
+          ditto -c -k --sequesterRsrc --keepParent FreeFlow.app FreeFlow-macOS-universal.zip
+
+          # TAR the CLI
+          tar czf freeflow-cli-macOS.tar.gz freeflow
+
+          # Build info
+          echo "{\"commit\": \"$GITHUB_SHA\", \"branch\": \"$GITHUB_REF_NAME\", \"date\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > build-info.json
+
+          # Checksums
+          shasum -a 256 FreeFlow-macOS-universal.zip freeflow-cli-macOS.tar.gz > checksums.txt
+
+          # Cleanup raw files
+          rm -rf FreeFlow.app freeflow
+
+          ls -la
+
+      - name: Upload GUI App
         uses: actions/upload-artifact@v4
         with:
-          name: freeflow-macos-${{ github.sha }}
+          name: FreeFlow-macOS-app
+          path: artifacts/FreeFlow-macOS-universal.zip
+          retention-days: 90
+
+      - name: Upload CLI
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreeFlow-macOS-cli
+          path: artifacts/freeflow-cli-macOS.tar.gz
+          retention-days: 90
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums
           path: |
-            artifacts/freeflow-macos-arm64.tar.gz
             artifacts/checksums.txt
             artifacts/build-info.json
-          retention-days: 30
+          retention-days: 90

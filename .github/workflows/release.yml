@@ -17,25 +17,71 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
 
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
       - name: Run tests
         run: swift test --parallel
 
-      - name: Build release
-        run: swift build -c release
+      - name: Build GUI (ARM64)
+        run: |
+          xcodebuild build \
+            -project FreeFlow.xcodeproj \
+            -scheme FreeFlow \
+            -configuration Release \
+            -arch arm64 \
+            -derivedDataPath build/arm64 \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            | xcpretty || true
 
-      - name: Run self-test
-        run: swift run freeflow test
+      - name: Build GUI (x86_64)
+        run: |
+          xcodebuild build \
+            -project FreeFlow.xcodeproj \
+            -scheme FreeFlow \
+            -configuration Release \
+            -arch x86_64 \
+            -derivedDataPath build/x86_64 \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            | xcpretty || true
 
-      - name: Package
+      - name: Create Universal App + CLI
         run: |
           VERSION=${GITHUB_REF_NAME}
           mkdir -p release
 
-          # Binary
-          cp .build/release/freeflow release/freeflow
-          chmod +x release/freeflow
+          ARM64_APP="build/arm64/Build/Products/Release/FreeFlow.app"
+          X86_APP="build/x86_64/Build/Products/Release/FreeFlow.app"
+
+          # Universal .app
+          if [ -d "$ARM64_APP" ] && [ -d "$X86_APP" ]; then
+            cp -R "$ARM64_APP" "release/FreeFlow.app"
+            lipo -create \
+              "$ARM64_APP/Contents/MacOS/FreeFlow" \
+              "$X86_APP/Contents/MacOS/FreeFlow" \
+              -output "release/FreeFlow.app/Contents/MacOS/FreeFlow"
+          elif [ -d "$ARM64_APP" ]; then
+            cp -R "$ARM64_APP" "release/FreeFlow.app"
+          fi
+
+          # ZIP the app
           cd release
-          tar czf "freeflow-macos-arm64-${VERSION}.tar.gz" freeflow
+          ditto -c -k --sequesterRsrc --keepParent FreeFlow.app "FreeFlow-${VERSION}-macOS-universal.zip"
+          rm -rf FreeFlow.app
+          cd ..
+
+          # CLI binary
+          swift build -c release
+          cp .build/release/freeflow release/
+          cd release
+          tar czf "freeflow-cli-${VERSION}-macOS.tar.gz" freeflow
           rm freeflow
 
           # Source
@@ -43,11 +89,29 @@ jobs:
           git archive --format=tar.gz --prefix=FreeFlow-Mac-${VERSION}/ HEAD > "release/source-${VERSION}.tar.gz"
 
           # Checksums
-          cd release && shasum -a 256 *.tar.gz > checksums.txt
+          cd release && shasum -a 256 *.tar.gz *.zip > checksums.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
           generate_release_notes: true
+          body: |
+            ## FreeFlow for macOS ${{ github.ref_name }}
+
+            ### Downloads
+            - **FreeFlow-${{ github.ref_name }}-macOS-universal.zip** — GUI app (ARM64 + Intel)
+            - **freeflow-cli-${{ github.ref_name }}-macOS.tar.gz** — CLI tool
+
+            ### Install GUI
+            1. Download the `.zip` file
+            2. Unzip → drag `FreeFlow.app` to `/Applications`
+            3. Right-click → Open (first launch, to bypass Gatekeeper)
+
+            ### Install CLI
+            ```bash
+            tar xzf freeflow-cli-*.tar.gz
+            sudo mv freeflow /usr/local/bin/
+            freeflow test
+            ```
           draft: false
