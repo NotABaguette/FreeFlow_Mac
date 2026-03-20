@@ -1,5 +1,7 @@
 import SwiftUI
+#if canImport(FreeFlowCore)
 import FreeFlowCore
+#endif
 
 @main
 struct FreeFlowApp: App {

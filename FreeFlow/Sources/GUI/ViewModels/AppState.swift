@@ -1,5 +1,7 @@
 import SwiftUI
+#if canImport(FreeFlowCore)
 import FreeFlowCore
+#endif
 import CryptoKit
 
 /// Central app state shared across all views
