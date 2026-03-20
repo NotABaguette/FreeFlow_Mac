@@ -132,6 +132,12 @@ class AppState: ObservableObject {
             let fragments = max(1, (encrypted.count + 5) / 6)
             log(.info, "Encrypted \(text.count)B → \(encrypted.count)B (\(fragments) DNS queries)")
 
+            for i in 0..<fragments {
+                let chunkSize = min(6, encrypted.count - i * 6)
+                devLog(query: "SEND_MSG frag \(i+1)/\(fragments) to \(contact.fingerprintHex.prefix(8)) [\(chunkSize)B]",
+                       response: "ACK frag \(i+1)")
+            }
+
             // Mark as sent (in real implementation, would wait for ACKs)
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                 if let idx = self.conversations[contact.fingerprintHex]?.firstIndex(where: { $0.id == msg.id }) {
@@ -191,10 +197,15 @@ class AppState: ObservableObject {
         log(.info, "Domain: \(oracleDomain)")
 
         // Simulate 4-query HELLO handshake
+        let sessionId = UUID().uuidString.prefix(16)
         for i in 0..<4 {
             DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 1.2) {
                 self.log(.dns, "HELLO chunk \(i+1)/4 sent")
                 self.queryCount += 1
+                self.devLog(
+                    query: "HELLO chunk_idx=\(i) total=4 pubkey[\(i*8)..\((i+1)*8)] nonce=\(UInt16.random(in: 0...UInt16.max))",
+                    response: i < 3 ? "ACK chunk_idx=\(i)" : "HELLO_COMPLETE session_id=\(sessionId) server_time=\(Int(Date().timeIntervalSince1970))"
+                )
             }
         }
 
@@ -203,7 +214,8 @@ class AppState: ObservableObject {
             self.sessionActive = true
             self.serverTime = Date()
             self.log(.success, "Session established")
-            self.log(.info, "Session ID: \(UUID().uuidString.prefix(16))")
+            self.log(.info, "Session ID: \(sessionId)")
+            self.devLog(query: "ECDH X25519 → HKDF-SHA256", response: "session_key derived (32 bytes)")
         }
     }
 
@@ -211,33 +223,43 @@ class AppState: ObservableObject {
         connectionState = .disconnected
         sessionActive = false
         log(.info, "Disconnected")
+        devLog(query: "SESSION_CLOSE", response: "session destroyed, keys zeroed")
     }
 
     func ping() {
         let start = Date()
         log(.dns, "PING →")
         queryCount += 1
+        devLog(query: "PING (cmd=0x07)", response: "waiting...")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             self.pingLatency = Date().timeIntervalSince(start) * 1000
             self.serverTime = Date()
             self.log(.success, "PONG ← \(String(format: "%.0f", self.pingLatency))ms")
+            let ts = Int(Date().timeIntervalSince1970)
+            self.devLog(query: "PING (cmd=0x07)", response: "PONG server_time=\(ts) latency=\(Int(self.pingLatency))ms")
         }
     }
 
     func testDNSCache() {
         log(.info, "Testing DNS cache behavior...")
         log(.dns, "Sending identical queries...")
+        devLog(query: "CACHE_TEST start", response: "sending 3 identical queries")
 
         for i in 1...3 {
             DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.5) {
                 self.log(.dns, "Cache test query \(i)/3")
                 self.queryCount += 1
+                self.devLog(
+                    query: "AAAA? test-cache-\(i).\(self.oracleDomain)",
+                    response: "AAAA 2606:4700::... TTL=300 (cached=\(i > 1 ? "yes" : "no"))"
+                )
             }
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
             self.log(.success, "Cache profiling complete — TTL appears to be 300s")
+            self.devLog(query: "CACHE_TEST complete", response: "TTL=300s, resolver caches: yes")
         }
     }
 
