@@ -149,20 +149,29 @@ public class FFConnection: ObservableObject {
         let plaintext = [UInt8](text.utf8)
         let ciphertext = try E2ECrypto.encrypt(key: e2eKey, plaintext: plaintext)
 
-        // Fragment ciphertext — Go uses Data field directly
-        let chunkSize = 50  // Match Go's fragment size
-        let fragments = stride(from: 0, to: ciphertext.count, by: chunkSize).map {
-            Array(ciphertext[$0..<min($0 + chunkSize, ciphertext.count)])
+        // CRITICAL: Oracle expects Data = [recipientFingerprint(8)][ciphertext]
+        // Fingerprint = SHA256(publicKey)[0:8], NOT raw pubkey bytes
+        let recipientFP = contact.fingerprintHex
+        guard let fpBytes = hexToBytes(recipientFP) else { throw FFError.invalidKey }
+
+        // Build full data: fingerprint(8) + ciphertext
+        var fullData = fpBytes
+        fullData.append(contentsOf: ciphertext)
+
+        // Fragment the full data blob
+        let chunkSize = 50
+        let fragments = stride(from: 0, to: fullData.count, by: chunkSize).map {
+            Array(fullData[$0..<min($0 + chunkSize, fullData.count)])
         }
 
-        let fpHex = contact.fingerprintHex.prefix(8)
         for (i, fragment) in fragments.enumerated() {
             try await Task.sleep(nanoseconds: UInt64(optimalDelay * 1_000_000_000))
             let seq = sess.nextSeqNo()
             let token = sess.token(for: seq)
 
-            // Go: BuildSendMsgPayload(fragIdx, totalFrags, token, fragment)
-            // Frame: [cmd=0x03][seqNo=i][fragIdx=i][fragTotal=n][token(4)][data=fragment]
+            // Go: BuildSendMsgPayload(fragIdx, totalFrags, token, data)
+            // Data = [recipientFP(8)][ciphertext_chunk] for first frag,
+            //        [ciphertext_chunk] for subsequent frags
             let frame = QueryPayload(
                 command: Command.sendMsg.rawValue,
                 seqNo: UInt8(i),
@@ -172,7 +181,7 @@ public class FFConnection: ObservableObject {
                 data: fragment
             ).toFrame()
 
-            onQuery?("SEND_MSG frag=\(i+1)/\(fragments.count) to=\(fpHex) \(fragment.count)B", "sending \(frame.count)B frame...", transport)
+            onQuery?("SEND_MSG frag=\(i+1)/\(fragments.count) to=\(recipientFP.prefix(8)) \(fragment.count)B", "sending \(frame.count)B frame...", transport)
             let response = try await queryOracle(payload: frame)
             onQuery?("SEND_MSG frag=\(i+1)/\(fragments.count)", "ACK \(response.count)B", transport)
         }
@@ -181,34 +190,76 @@ public class FFConnection: ObservableObject {
 
     // MARK: - GET MESSAGES
 
+    /// Poll for incoming messages using the Oracle's sub-protocol:
+    /// Step 1: CHECK (0x00) — is there a pending message?
+    /// Step 2: FETCH (0x01) × N — download 8 bytes at a time
+    /// Step 3: ACK (0x02) — mark delivered
     public func pollMessages() async throws -> (data: [UInt8], senderFP: [UInt8])? {
         guard let sess = session else { throw FFError.noSession }
 
+        // Step 1: CHECK
         try await Task.sleep(nanoseconds: UInt64(optimalDelay * 1_000_000_000))
-        let seq = sess.nextSeqNo()
-        let token = sess.token(for: seq)
+        let seq1 = sess.nextSeqNo()
+        let token1 = sess.token(for: seq1)
 
-        // Go: BuildGetMsgPayload(token, lastMsgID=0)
-        let frame = QueryPayload(
+        let checkFrame = QueryPayload(
             command: Command.getMsg.rawValue,
-            sessionToken: token,
-            data: [0] // lastMsgID = 0
+            sessionToken: token1,
+            data: [0x00] // CHECK sub-command
         ).toFrame()
 
-        onQuery?("GET_MSG seq=\(seq)", "sending \(frame.count)B frame...", transport)
-        let response = try await queryOracle(payload: frame)
+        onQuery?("GET_MSG CHECK", "sending...", transport)
+        let checkResp = try await queryOracle(payload: checkFrame)
 
-        if response.count <= 1 {
-            onQuery?("GET_MSG", "empty (no messages)", transport)
+        // Response: [0x00,...] = no messages, [0x01, senderFP(4), lenHi, lenLo, 0] = has message
+        guard checkResp.count >= 1 && checkResp[0] == 0x01 else {
+            onQuery?("GET_MSG CHECK", "no pending messages", transport)
             return nil
         }
 
-        onQuery?("GET_MSG", "data=\(response.count)B", transport)
+        let totalLen = checkResp.count >= 7 ? (Int(checkResp[5]) << 8 | Int(checkResp[6])) : 0
+        onQuery?("GET_MSG CHECK", "message found, totalLen=\(totalLen)B", transport)
 
-        // Response format: [sender_fp(8)][ciphertext...]
-        guard response.count > 8 else { return nil }
-        let senderFP = Array(response[0..<8])
-        let ciphertext = Array(response[8...])
+        // Step 2: FETCH chunks (8 bytes per response)
+        var blob = [UInt8]()
+        let chunksNeeded = max(1, (totalLen + 7) / 8)
+
+        for chunkIdx in 0..<chunksNeeded {
+            try await Task.sleep(nanoseconds: UInt64(optimalDelay * 1_000_000_000))
+            let seqN = sess.nextSeqNo()
+            let tokenN = sess.token(for: seqN)
+
+            let fetchFrame = QueryPayload(
+                command: Command.getMsg.rawValue,
+                sessionToken: tokenN,
+                data: [0x01, UInt8(chunkIdx)] // FETCH sub-command + chunk index
+            ).toFrame()
+
+            onQuery?("GET_MSG FETCH chunk=\(chunkIdx)", "sending...", transport)
+            let fetchResp = try await queryOracle(payload: fetchFrame)
+            blob.append(contentsOf: fetchResp)
+            onQuery?("GET_MSG FETCH chunk=\(chunkIdx)", "got \(fetchResp.count)B", transport)
+        }
+
+        // Step 3: ACK
+        try await Task.sleep(nanoseconds: UInt64(optimalDelay * 1_000_000_000))
+        let seqAck = sess.nextSeqNo()
+        let tokenAck = sess.token(for: seqAck)
+
+        let ackFrame = QueryPayload(
+            command: Command.getMsg.rawValue,
+            sessionToken: tokenAck,
+            data: [0x02] // ACK sub-command
+        ).toFrame()
+
+        onQuery?("GET_MSG ACK", "sending...", transport)
+        _ = try await queryOracle(payload: ackFrame)
+        onQuery?("GET_MSG ACK", "delivered", transport)
+
+        // Parse blob: [senderFP(8)][ciphertext...]
+        guard blob.count > 8 else { return nil }
+        let senderFP = Array(blob[0..<8])
+        let ciphertext = Array(blob[8..<min(blob.count, totalLen > 0 ? totalLen : blob.count)])
         return (ciphertext, senderFP)
     }
 
@@ -319,6 +370,19 @@ public class FFConnection: ObservableObject {
 
     /// Extract the Oracle's atomic counter from a cache test AAAA response
     /// Response format: [2001:0db8:<ttl>:<seq>:<counter_hi>:<counter_lo>:<ts_hi>:<ts_lo>]
+    private func hexToBytes(_ hex: String) -> [UInt8]? {
+        let clean = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        var bytes = [UInt8]()
+        var i = clean.startIndex
+        while i < clean.endIndex {
+            guard let next = clean.index(i, offsetBy: 2, limitedBy: clean.endIndex) else { return nil }
+            guard let byte = UInt8(clean[i..<next], radix: 16) else { return nil }
+            bytes.append(byte)
+            i = next
+        }
+        return bytes
+    }
+
     private func extractCounter(from ips: [[UInt8]]) -> UInt32 {
         guard let ip = ips.first, ip.count >= 12 else { return 0 }
         return UInt32(ip[8]) << 24 | UInt32(ip[9]) << 16 | UInt32(ip[10]) << 8 | UInt32(ip[11])
