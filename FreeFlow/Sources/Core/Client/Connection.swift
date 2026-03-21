@@ -89,9 +89,14 @@ public class FFConnection: ObservableObject {
                     response: response, sessionKey: sessionKeyBytes)
 
                 session = FFSession(id: sessionID, keyBytes: sessionKeyBytes)
-                state = .connected
                 let sidHex = sessionID.map { String(format: "%02x", $0) }.joined()
                 onQuery?("HELLO_COMPLETE", "session_id=\(sidHex) key_derived=32B", transport)
+
+                // Auto-REGISTER after HELLO (matches Go client flow)
+                try await Task.sleep(nanoseconds: UInt64(optimalDelay * 1_000_000_000))
+                try await register()
+
+                state = .connected
             } else {
                 onQuery?("HELLO chunk=\(i)/4", "ACK chunk_idx=\(i)", transport)
                 try await Task.sleep(nanoseconds: UInt64(optimalDelay * 1_000_000_000))
@@ -107,25 +112,34 @@ public class FFConnection: ObservableObject {
 
     // MARK: - REGISTER
 
+    /// Register persistent identity with the session.
+    /// Must be called after connect(). Oracle expects Data = publicKey(32 bytes only).
+    /// Oracle computes fingerprint = SHA256(pubkey)[0:8] itself.
     public func register() async throws {
         guard let sess = session else { throw FFError.noSession }
         let seq = sess.nextSeqNo()
         let token = sess.token(for: seq)
 
-        // Data: [pubkey(32)][fingerprint(8)]
-        var data = identity.publicKey
-        data.append(contentsOf: identity.fingerprint)
-
+        // Go: Data = id.PublicKey[:] — just the 32-byte public key
+        // Oracle computes fingerprint from this
         let frame = QueryPayload(
-            command: 0x08,
+            command: 0x08, // CmdREGISTER
             seqNo: UInt8(seq & 0xFF),
+            fragIndex: 0,
+            fragTotal: 1,
             sessionToken: token,
-            data: data
+            data: identity.publicKey // 32 bytes only, no fingerprint
         ).toFrame()
 
-        onQuery?("REGISTER fp=\(identity.fingerprintHex)", "sending \(frame.count)B frame...", transport)
+        onQuery?("REGISTER pubkey=\(identity.publicKey.prefix(4).map { String(format: "%02x", $0) }.joined())...", "sending \(frame.count)B frame...", transport)
         let response = try await queryOracle(payload: frame)
-        onQuery?("REGISTER", "response=\(response.count)B", transport)
+
+        if response.count >= 8 {
+            let fpHex = response.prefix(8).map { String(format: "%02x", $0) }.joined()
+            onQuery?("REGISTER", "OK fingerprint=\(fpHex)", transport)
+        } else {
+            onQuery?("REGISTER", "response=\(response.count)B", transport)
+        }
     }
 
     // MARK: - GET BULLETIN
