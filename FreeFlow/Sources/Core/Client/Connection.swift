@@ -219,6 +219,7 @@ public class FFConnection: ObservableObject {
 
         let checkFrame = QueryPayload(
             command: Command.getMsg.rawValue,
+            seqNo: UInt8(seq1 & 0xFF),
             sessionToken: token1,
             data: [0x00] // CHECK sub-command
         ).toFrame()
@@ -246,6 +247,7 @@ public class FFConnection: ObservableObject {
 
             let fetchFrame = QueryPayload(
                 command: Command.getMsg.rawValue,
+                seqNo: UInt8(seqN & 0xFF),
                 sessionToken: tokenN,
                 data: [0x01, UInt8(chunkIdx)] // FETCH sub-command + chunk index
             ).toFrame()
@@ -263,6 +265,7 @@ public class FFConnection: ObservableObject {
 
         let ackFrame = QueryPayload(
             command: Command.getMsg.rawValue,
+            seqNo: UInt8(seqAck & 0xFF),
             sessionToken: tokenAck,
             data: [0x02] // ACK sub-command
         ).toFrame()
@@ -271,10 +274,18 @@ public class FFConnection: ObservableObject {
         _ = try await queryOracle(payload: ackFrame)
         onQuery?("GET_MSG ACK", "delivered", transport)
 
+        // Trim blob to actual totalLen (Go: blob = blob[:totalLen])
+        let trimmedBlob: [UInt8]
+        if totalLen > 0 && blob.count > totalLen {
+            trimmedBlob = Array(blob[0..<totalLen])
+        } else {
+            trimmedBlob = blob
+        }
+
         // Parse blob: [senderFP(8)][ciphertext...]
-        guard blob.count > 8 else { return nil }
-        let senderFP = Array(blob[0..<8])
-        let ciphertext = Array(blob[8..<min(blob.count, totalLen > 0 ? totalLen : blob.count)])
+        guard trimmedBlob.count > 8 else { return nil }
+        let senderFP = Array(trimmedBlob[0..<8])
+        let ciphertext = Array(trimmedBlob[8...])
         return (ciphertext, senderFP)
     }
 
