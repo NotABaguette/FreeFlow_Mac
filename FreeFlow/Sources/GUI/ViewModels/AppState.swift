@@ -42,6 +42,7 @@ class AppState: ObservableObject {
     @Published var useRelayHTTP: Bool = false
     @Published var relayURL: String = "https://oracle.example.com:8443"
     @Published var relayAPIKey: String = ""
+    @Published var relayAllowInsecure: Bool = false
 
     // Dev mode
     @Published var devMode: Bool = false
@@ -121,6 +122,7 @@ class AppState: ObservableObject {
         conn.useRelay = useRelayHTTP
         conn.relayURL = relayURL
         conn.relayAPIKey = relayAPIKey
+        conn.relayAllowInsecure = relayAllowInsecure
 
         // Wire up dev logging
         conn.onQuery = { [weak self] query, response, transport in

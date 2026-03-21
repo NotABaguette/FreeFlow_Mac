@@ -17,6 +17,7 @@ public class FFConnection: ObservableObject {
     public var useRelay: Bool = false
     public var relayURL: String = ""
     public var relayAPIKey: String = ""
+    public var relayAllowInsecure: Bool = false
 
     /// Called for every query/response when set (for dev logging)
     public var onQuery: ((_ query: String, _ response: String, _ transport: String) -> Void)?
@@ -265,7 +266,7 @@ public class FFConnection: ObservableObject {
         return responsePayload
     }
 
-    /// HTTP Relay transport
+    /// HTTP Relay transport (supports both HTTPS and insecure HTTP)
     private func queryViaHTTP(payload: [UInt8]) async throws -> [UInt8] {
         guard !relayURL.isEmpty else { throw FFError.helloFailed("Relay URL not configured") }
 
@@ -279,10 +280,19 @@ public class FFConnection: ObservableObject {
         request.httpBody = Data(payload)
         request.timeoutInterval = 15
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let session: URLSession
+        if relayAllowInsecure {
+            let config = URLSessionConfiguration.default
+            session = URLSession(configuration: config, delegate: InsecureDelegate.shared, delegateQueue: nil)
+        } else {
+            session = URLSession.shared
+        }
+
+        let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode == 200 else {
-            throw FFError.helloFailed("HTTP relay returned error")
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            throw FFError.helloFailed("HTTP relay returned status \(code)")
         }
         await rateLimiter.record(success: true)
         return [UInt8](data)
@@ -415,5 +425,18 @@ enum DNSPacket {
             pos += rdLength
         }
         return records
+    }
+}
+
+/// Allows insecure HTTP and self-signed HTTPS connections for relay transport
+private class InsecureDelegate: NSObject, URLSessionDelegate {
+    static let shared = InsecureDelegate()
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        if let trust = challenge.protectionSpace.serverTrust {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        } else {
+            completionHandler(.performDefaultHandling, nil)
+        }
     }
 }

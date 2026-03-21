@@ -53,6 +53,12 @@ struct SettingsPanel: View {
                         .font(.system(.body, design: .monospaced))
                     TextField("API Key", text: $state.relayAPIKey)
                         .font(.system(.body, design: .monospaced))
+                    Toggle("Allow insecure HTTP (no TLS)", isOn: $state.relayAllowInsecure)
+                    if state.relayAllowInsecure {
+                        Text("WARNING: Traffic will not be encrypted in transit. Only use on trusted networks or for testing.")
+                            .font(.caption)
+                            .foregroundColor(.red)
+                    }
                 }
             }
 
