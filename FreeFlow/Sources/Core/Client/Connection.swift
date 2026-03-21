@@ -36,6 +36,8 @@ public class FFConnection: ObservableObject {
     // MARK: - PING
 
     public func ping() async throws -> Date {
+        // PING uses compact format + lexical encoding (stateless command)
+        // Go: BuildCompact(CmdPING) = [0x07]
         let payload: [UInt8] = [Command.ping.rawValue]
         onQuery?("PING cmd=0x07", "sending...", transport)
         let response = try await queryOracle(payload: payload)
@@ -58,15 +60,27 @@ public class FFConnection: ObservableObject {
 
         for i in 0..<4 {
             let chunk = Array(pubBytes[(i*8)..<((i+1)*8)])
-            var payload: [UInt8] = [Command.hello.rawValue, UInt8(i), 4]
-            payload.append(UInt8((helloNonce >> 8) & 0xFF))
-            payload.append(UInt8(helloNonce & 0xFF))
-            payload.append(contentsOf: chunk)
+
+            // Build HELLO frame matching Go's BuildHelloChunkPayload:
+            // Data: [chunkIdx][totalChunks][nonce_hi][nonce_lo][8_bytes]
+            var data: [UInt8] = [UInt8(i), 4]
+            data.append(UInt8((helloNonce >> 8) & 0xFF))
+            data.append(UInt8(helloNonce & 0xFF))
+            data.append(contentsOf: chunk)
+
+            // Frame: [cmd=0x01][seqNo=i][fragIdx=i][fragTotal=4][token=0000][data]
+            let frame = QueryPayload(
+                command: Command.hello.rawValue,
+                seqNo: UInt8(i),
+                fragIndex: UInt8(i),
+                fragTotal: 4,
+                data: data
+            ).toFrame()
 
             let chunkHex = chunk.map { String(format: "%02x", $0) }.joined()
-            onQuery?("HELLO chunk=\(i)/4 nonce=\(helloNonce) data=\(chunkHex)", "sending...", transport)
+            onQuery?("HELLO chunk=\(i)/4 nonce=\(helloNonce) data=\(chunkHex)", "sending \(frame.count)B frame...", transport)
 
-            let response = try await queryOracle(payload: payload)
+            let response = try await queryOracle(payload: frame)
 
             if i == 3 {
                 let sharedSecret = try ephemeral.sharedSecret(with: oraclePublicKey)
@@ -98,25 +112,30 @@ public class FFConnection: ObservableObject {
         let seq = sess.nextSeqNo()
         let token = sess.token(for: seq)
 
-        var payload: [UInt8] = [0x08] // REGISTER command
-        payload.append(contentsOf: token)
-        payload.append(contentsOf: identity.publicKey)
-        payload.append(contentsOf: identity.fingerprint)
+        // Data: [pubkey(32)][fingerprint(8)]
+        var data = identity.publicKey
+        data.append(contentsOf: identity.fingerprint)
 
-        onQuery?("REGISTER fp=\(identity.fingerprintHex)", "sending...", transport)
-        let response = try await queryOracle(payload: payload)
+        let frame = QueryPayload(
+            command: 0x08,
+            seqNo: UInt8(seq & 0xFF),
+            sessionToken: token,
+            data: data
+        ).toFrame()
+
+        onQuery?("REGISTER fp=\(identity.fingerprintHex)", "sending \(frame.count)B frame...", transport)
+        let response = try await queryOracle(payload: frame)
         onQuery?("REGISTER", "response=\(response.count)B", transport)
     }
 
     // MARK: - GET BULLETIN
 
     public func getBulletin(lastSeenID: UInt16 = 0) async throws -> [UInt8] {
-        var payload: [UInt8] = [Command.getBulletin.rawValue]
-        payload.append(UInt8((lastSeenID >> 8) & 0xFF))
-        payload.append(UInt8(lastSeenID & 0xFF))
+        // Go: BuildCompact(CmdGET_BULLETIN) — uses lexical encoding
+        let frame: [UInt8] = [Command.getBulletin.rawValue]
 
         onQuery?("GET_BULLETIN lastID=\(lastSeenID)", "sending...", transport)
-        let response = try await queryOracle(payload: payload)
+        let response = try await queryOracle(payload: frame)
         onQuery?("GET_BULLETIN", "response=\(response.count)B", transport)
         return response
     }
@@ -130,7 +149,8 @@ public class FFConnection: ObservableObject {
         let plaintext = [UInt8](text.utf8)
         let ciphertext = try E2ECrypto.encrypt(key: e2eKey, plaintext: plaintext)
 
-        let chunkSize = 6
+        // Fragment ciphertext — Go uses Data field directly
+        let chunkSize = 50  // Match Go's fragment size
         let fragments = stride(from: 0, to: ciphertext.count, by: chunkSize).map {
             Array(ciphertext[$0..<min($0 + chunkSize, ciphertext.count)])
         }
@@ -141,15 +161,19 @@ public class FFConnection: ObservableObject {
             let seq = sess.nextSeqNo()
             let token = sess.token(for: seq)
 
-            var payload: [UInt8] = [Command.sendMsg.rawValue]
-            payload.append(UInt8(i))
-            payload.append(UInt8(fragments.count))
-            payload.append(contentsOf: token)
-            payload.append(contentsOf: Array(contact.publicKey.prefix(8)))
-            payload.append(contentsOf: fragment)
+            // Go: BuildSendMsgPayload(fragIdx, totalFrags, token, fragment)
+            // Frame: [cmd=0x03][seqNo=i][fragIdx=i][fragTotal=n][token(4)][data=fragment]
+            let frame = QueryPayload(
+                command: Command.sendMsg.rawValue,
+                seqNo: UInt8(i),
+                fragIndex: UInt8(i),
+                fragTotal: UInt8(fragments.count),
+                sessionToken: token,
+                data: fragment
+            ).toFrame()
 
-            onQuery?("SEND_MSG frag=\(i+1)/\(fragments.count) to=\(fpHex) \(fragment.count)B", "sending...", transport)
-            let response = try await queryOracle(payload: payload)
+            onQuery?("SEND_MSG frag=\(i+1)/\(fragments.count) to=\(fpHex) \(fragment.count)B", "sending \(frame.count)B frame...", transport)
+            let response = try await queryOracle(payload: frame)
             onQuery?("SEND_MSG frag=\(i+1)/\(fragments.count)", "ACK \(response.count)B", transport)
         }
         return fragments.count
@@ -164,12 +188,15 @@ public class FFConnection: ObservableObject {
         let seq = sess.nextSeqNo()
         let token = sess.token(for: seq)
 
-        var payload: [UInt8] = [Command.getMsg.rawValue]
-        payload.append(contentsOf: token)
-        payload.append(0)
+        // Go: BuildGetMsgPayload(token, lastMsgID=0)
+        let frame = QueryPayload(
+            command: Command.getMsg.rawValue,
+            sessionToken: token,
+            data: [0] // lastMsgID = 0
+        ).toFrame()
 
-        onQuery?("GET_MSG seq=\(seq)", "sending...", transport)
-        let response = try await queryOracle(payload: payload)
+        onQuery?("GET_MSG seq=\(seq)", "sending \(frame.count)B frame...", transport)
+        let response = try await queryOracle(payload: frame)
 
         if response.count <= 1 {
             onQuery?("GET_MSG", "empty (no messages)", transport)
@@ -202,8 +229,8 @@ public class FFConnection: ObservableObject {
         let seq = sess.nextSeqNo()
         let token = sess.token(for: seq)
 
-        var payload: [UInt8] = [Command.discover.rawValue]
-        payload.append(contentsOf: token)
+        // Go: BuildCompact(CmdDISCOVER) — lexical encoding
+        let payload: [UInt8] = [Command.discover.rawValue]
 
         onQuery?("DISCOVER", "sending...", transport)
         let response = try await queryOracle(payload: payload)
@@ -311,12 +338,56 @@ public class FFConnection: ObservableObject {
         }
     }
 
-    /// DNS AAAA transport
+    /// Determine if a command should use binary (hex) transport
+    /// HELLO, REGISTER, SEND_MSG, GET_MSG, ACK use hex-encoded binary frames
+    /// PING, GET_BULLETIN, DISCOVER use lexical encoding
+    private func useBinaryTransport(for command: UInt8) -> Bool {
+        switch command {
+        case Command.hello.rawValue,
+             Command.sendMsg.rawValue,
+             Command.getMsg.rawValue,
+             Command.ack.rawValue,
+             0x08: // REGISTER
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// DNS AAAA transport — uses hex binary transport or lexical encoding depending on command
+    ///
+    /// Per FreeFlow protocol:
+    /// - HELLO, REGISTER, SEND_MSG, GET_MSG, ACK → hex-encoded binary frames as DNS labels
+    /// - PING, GET_BULLETIN, DISCOVER → lexical encoding (steganographic)
+    ///
+    /// Binary transport format: payload bytes → hex string → split into 62-char DNS labels → .domain
+    /// Example: [0x01, 0x00, 0x04, ...] → "010004..." → "010004abcdef....<62 chars>.<next 62>.<domain>"
     private func queryViaDNS(payload: [UInt8]) async throws -> [UInt8] {
         let domain = domainManager.activeDomain()
-        let queryName = try LexicalEncoder.encodeQuery(
-            payload: payload, domain: domain, profile: profile)
+        let queryName: String
 
+        let cmd = payload.first ?? 0
+        if useBinaryTransport(for: cmd) {
+            // Binary transport: raw payload bytes → hex string → DNS labels
+            // The payload IS the frame (matches Go's sendBinaryDNSQuery)
+            let hexStr = payload.map { String(format: "%02x", $0) }.joined()
+
+            // Split hex into labels of max 62 chars (must be even length per Go impl)
+            var labels = [String]()
+            var i = hexStr.startIndex
+            while i < hexStr.endIndex {
+                let end = hexStr.index(i, offsetBy: 62, limitedBy: hexStr.endIndex) ?? hexStr.endIndex
+                labels.append(String(hexStr[i..<end]))
+                i = end
+            }
+            queryName = labels.joined(separator: ".") + "." + domain
+        } else {
+            // Lexical encoding for stateless commands (PING, GET_BULLETIN, DISCOVER)
+            queryName = try LexicalEncoder.encodeQuery(
+                payload: payload, domain: domain, profile: profile)
+        }
+
+        onQuery?("DNS_QUERY", queryName, transport)
         let ips = try await dnsQueryAAAA(name: queryName)
         let (responsePayload, _, _) = try AAAAEncoder.decode(ips)
         await rateLimiter.record(success: true)
