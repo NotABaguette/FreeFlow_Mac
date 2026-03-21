@@ -21,6 +21,11 @@ targets:
     sources:
       - path: FreeFlow/Sources/GUI
       - path: FreeFlow/Sources/Core
+        excludes:
+          - "**/*.json"
+    resources:
+      - path: FreeFlow/Sources/Core/Lexical/profiles
+        buildPhase: resources
     info:
       path: FreeFlow/Sources/GUI/Info.plist
     settings:

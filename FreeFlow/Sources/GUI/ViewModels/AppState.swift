@@ -80,24 +80,43 @@ class AppState: ObservableObject {
             log(.error, "Oracle public key not configured — set in Settings")
             return nil
         }
-        guard !bootstrapSeedHex.isEmpty else {
-            log(.error, "Bootstrap seed not configured — set in Settings")
-            return nil
-        }
         guard let oraclePK = hexToBytes(oraclePublicKeyHex), oraclePK.count == 32 else {
             log(.error, "Invalid Oracle public key — must be 64 hex chars (32 bytes)")
             return nil
         }
-        guard let seed = hexToBytes(bootstrapSeedHex), seed.count == 32 else {
-            log(.error, "Invalid bootstrap seed — must be 64 hex chars (32 bytes)")
-            return nil
+
+        // Seed is optional — if empty, use zeros (domain will be set manually)
+        let seed: [UInt8]
+        if let parsed = hexToBytes(bootstrapSeedHex), parsed.count == 32 {
+            seed = parsed
+        } else {
+            seed = [UInt8](repeating: 0, count: 32)
         }
 
-        // For now use an empty profile — the Oracle will match
-        let profile = LexicalProfile(id: "default", category: "default",
-                                      templates: [], wordLists: [:])
+        // Load lexical profiles from bundled JSON files or from data dir
+        var profiles = LexicalProfile.loadAll(
+            from: dataDir.appendingPathComponent("profiles"))
+        if profiles.isEmpty {
+            // Try bundled profiles
+            profiles = LexicalProfile.loadBundled()
+        }
+
+        // Assign profile based on public key, or use first available
+        let profile: LexicalProfile
+        if !profiles.isEmpty {
+            profile = LexicalProfile.assign(publicKey: id.publicKey, profiles: profiles)
+            log(.info, "Loaded \(profiles.count) lexical profiles, assigned: \(profile.id)")
+        } else {
+            log(.warning, "No lexical profiles found — using hex-encoded transport")
+            profile = LexicalProfile(id: "hex", category: "hex", templates: [], wordLists: [:])
+        }
 
         let conn = FFConnection(identity: id, oraclePublicKey: oraclePK, seed: seed, profile: profile)
+
+        // If user set a domain, use that directly (bypass DGA)
+        if !oracleDomain.isEmpty {
+            conn.domainManager.fixedDomain = oracleDomain
+        }
         conn.resolver = resolverAddress
         conn.useRelay = useRelayHTTP
         conn.relayURL = relayURL
