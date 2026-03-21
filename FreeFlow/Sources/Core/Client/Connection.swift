@@ -163,43 +163,44 @@ public class FFConnection: ObservableObject {
         let plaintext = [UInt8](text.utf8)
         let ciphertext = try E2ECrypto.encrypt(key: e2eKey, plaintext: plaintext)
 
-        // CRITICAL: Oracle expects Data = [recipientFingerprint(8)][ciphertext]
-        // Fingerprint = SHA256(publicKey)[0:8], NOT raw pubkey bytes
+        // Recipient fingerprint = SHA256(publicKey)[0:8]
         let recipientFP = contact.fingerprintHex
         guard let fpBytes = hexToBytes(recipientFP) else { throw FFError.invalidKey }
 
-        // Build full data: fingerprint(8) + ciphertext
-        var fullData = fpBytes
-        fullData.append(contentsOf: ciphertext)
-
-        // Fragment the full data blob
-        let chunkSize = 50
-        let fragments = stride(from: 0, to: fullData.count, by: chunkSize).map {
-            Array(fullData[$0..<min($0 + chunkSize, fullData.count)])
+        // Fragment CIPHERTEXT only (not fp+ciphertext).
+        // Go: each fragment's Data = [recipientFP(8)] + [ciphertext_chunk]
+        // The fingerprint is prepended to EVERY fragment, not just the first one.
+        let maxCiphertextPerFragment = 50
+        var ctFragments = [[UInt8]]()
+        for i in stride(from: 0, to: ciphertext.count, by: maxCiphertextPerFragment) {
+            let end = min(i + maxCiphertextPerFragment, ciphertext.count)
+            ctFragments.append(Array(ciphertext[i..<end]))
         }
+        if ctFragments.isEmpty { ctFragments.append([]) }
 
-        for (i, fragment) in fragments.enumerated() {
+        for (i, ctChunk) in ctFragments.enumerated() {
             try await Task.sleep(nanoseconds: UInt64(optimalDelay * 1_000_000_000))
             let seq = sess.nextSeqNo()
             let token = sess.token(for: seq)
 
-            // Go: BuildSendMsgPayload(fragIdx, totalFrags, token, data)
-            // Data = [recipientFP(8)][ciphertext_chunk] for first frag,
-            //        [ciphertext_chunk] for subsequent frags
+            // Data = [recipientFP(8)] + [ciphertext_chunk] for EVERY fragment
+            var data = fpBytes  // 8 bytes fingerprint
+            data.append(contentsOf: ctChunk)
+
             let frame = QueryPayload(
                 command: Command.sendMsg.rawValue,
-                seqNo: UInt8(i),
+                seqNo: UInt8(seq & 0xFF),
                 fragIndex: UInt8(i),
-                fragTotal: UInt8(fragments.count),
+                fragTotal: UInt8(ctFragments.count),
                 sessionToken: token,
-                data: fragment
+                data: data
             ).toFrame()
 
-            onQuery?("SEND_MSG frag=\(i+1)/\(fragments.count) to=\(recipientFP.prefix(8)) \(fragment.count)B", "sending \(frame.count)B frame...", transport)
+            onQuery?("SEND_MSG frag=\(i+1)/\(ctFragments.count) to=\(recipientFP.prefix(8)) ct=\(ctChunk.count)B", "sending \(frame.count)B frame...", transport)
             let response = try await queryOracle(payload: frame)
-            onQuery?("SEND_MSG frag=\(i+1)/\(fragments.count)", "ACK \(response.count)B", transport)
+            onQuery?("SEND_MSG frag=\(i+1)/\(ctFragments.count)", "ACK \(response.count)B", transport)
         }
-        return fragments.count
+        return ctFragments.count
     }
 
     // MARK: - GET MESSAGES
