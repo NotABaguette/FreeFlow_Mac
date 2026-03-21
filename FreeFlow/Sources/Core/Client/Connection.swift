@@ -170,7 +170,11 @@ public class FFConnection: ObservableObject {
         // Fragment CIPHERTEXT only (not fp+ciphertext).
         // Go: each fragment's Data = [recipientFP(8)] + [ciphertext_chunk]
         // The fingerprint is prepended to EVERY fragment, not just the first one.
-        let maxCiphertextPerFragment = 50
+        //
+        // Per PROTOCOL.md §6.3:
+        //   Proquint: max frame=20B, header=8B, fp=8B → 4 bytes ciphertext/fragment
+        //   Hex:      max frame=31B per label, more capacity → 50 bytes/fragment
+        let maxCiphertextPerFragment = (encoding == .proquint) ? 4 : 50
         var ctFragments = [[UInt8]]()
         for i in stride(from: 0, to: ciphertext.count, by: maxCiphertextPerFragment) {
             let end = min(i + maxCiphertextPerFragment, ciphertext.count)
@@ -416,8 +420,18 @@ public class FFConnection: ObservableObject {
 
     // MARK: - Transport
 
+    /// Encoding mode for DNS queries
+    public enum QueryEncoding: String {
+        case proquint  // Primary — censored networks (CVCVC words)
+        case hex       // Simple — uncensored networks
+        case lexical   // Legacy — compact commands only
+    }
+
+    /// Active encoding mode (default: proquint per protocol §1.2.1)
+    public var encoding: QueryEncoding = .proquint
+
     private var transport: String {
-        useRelay ? "HTTP" : "DNS"
+        useRelay ? "HTTP" : "DNS(\(encoding.rawValue))"
     }
 
     private func queryOracle(payload: [UInt8]) async throws -> [UInt8] {
@@ -428,41 +442,50 @@ public class FFConnection: ObservableObject {
         }
     }
 
-    /// Determine if a command should use binary (hex) transport
-    /// HELLO, REGISTER, SEND_MSG, GET_MSG, ACK use hex-encoded binary frames
-    /// PING, GET_BULLETIN, DISCOVER use lexical encoding
-    private func useBinaryTransport(for command: UInt8) -> Bool {
-        switch command {
-        case Command.hello.rawValue,
-             Command.sendMsg.rawValue,
-             Command.getMsg.rawValue,
-             Command.ack.rawValue,
-             0x08: // REGISTER
-            return true
-        default:
-            return false
-        }
-    }
-
-    /// DNS AAAA transport — uses hex binary transport or lexical encoding depending on command
+    /// DNS AAAA transport — encodes frame as DNS query per PROTOCOL.md
     ///
-    /// Per FreeFlow protocol:
-    /// - HELLO, REGISTER, SEND_MSG, GET_MSG, ACK → hex-encoded binary frames as DNS labels
-    /// - PING, GET_BULLETIN, DISCOVER → lexical encoding (steganographic)
+    /// Encoding priority (§1.2):
+    ///   1. Proquint (primary): CVCVC words, 20 bytes/label, evades entropy detectors
+    ///   2. Hex: hex-encoded labels, 31 bytes/label, for uncensored networks
+    ///   3. Lexical: word-list steganography, for 1-2 byte compact commands only
     ///
-    /// Binary transport format: payload bytes → hex string → split into 62-char DNS labels → .domain
-    /// Example: [0x01, 0x00, 0x04, ...] → "010004..." → "010004abcdef....<62 chars>.<next 62>.<domain>"
+    /// Every query includes a unique q-<random> subdomain for cache isolation (§1.3)
     private func queryViaDNS(payload: [UInt8]) async throws -> [UInt8] {
         let domain = domainManager.activeDomain()
-        let queryName: String
 
-        let cmd = payload.first ?? 0
-        if useBinaryTransport(for: cmd) {
-            // Binary transport: raw payload bytes → hex string → DNS labels
-            // The payload IS the frame (matches Go's sendBinaryDNSQuery)
+        // Generate per-query cache-busting nonce (§1.3)
+        let nonce = (0..<8).map { _ in String(format: "%x", UInt8.random(in: 0...15)) }.joined()
+        let nonceLabel = "q-\(nonce)"
+
+        let frameLabels: String
+
+        switch encoding {
+        case .proquint:
+            // §1.2.1: Proquint encoding — all frames use this on censored networks
+            // Frames MUST have even byte length (pad if odd)
+            var frame = payload
+            if frame.count % 2 != 0 {
+                frame.append(0x00)
+            }
+            // Single label if ≤20 bytes, multi-label if larger
+            if frame.count <= Proquint.maxBytesPerLabel {
+                frameLabels = Proquint.encode(frame)
+            } else {
+                // Split across multiple proquint labels
+                var labels = [String]()
+                for i in stride(from: 0, to: frame.count, by: Proquint.maxBytesPerLabel) {
+                    let end = min(i + Proquint.maxBytesPerLabel, frame.count)
+                    var chunk = Array(frame[i..<end])
+                    if chunk.count % 2 != 0 { chunk.append(0x00) }
+                    labels.append(Proquint.encode(chunk))
+                }
+                frameLabels = labels.joined(separator: ".")
+            }
+
+        case .hex:
+            // §1.2.2: Hex encoding — frame bytes as hex labels
             let hexStr = payload.map { String(format: "%02x", $0) }.joined()
-
-            // Split hex into labels of max 62 chars (must be even length per Go impl)
+            // Max 62 hex chars per label (31 bytes)
             var labels = [String]()
             var i = hexStr.startIndex
             while i < hexStr.endIndex {
@@ -470,14 +493,18 @@ public class FFConnection: ObservableObject {
                 labels.append(String(hexStr[i..<end]))
                 i = end
             }
-            queryName = labels.joined(separator: ".") + "." + domain
-        } else {
-            // Lexical encoding for stateless commands (PING, GET_BULLETIN, DISCOVER)
-            queryName = try LexicalEncoder.encodeQuery(
-                payload: payload, domain: domain, profile: profile)
+            frameLabels = labels.joined(separator: ".")
+
+        case .lexical:
+            // §1.2.3: Lexical — only for 1-2 byte compact payloads
+            let label = try LexicalEncoder.encode(payload: payload, profile: profile)
+            frameLabels = label
         }
 
-        onQuery?("DNS_QUERY", queryName, transport)
+        // Assemble: <frame_labels>.q-<nonce>.<domain>
+        let queryName = "\(frameLabels).\(nonceLabel).\(domain)"
+
+        onQuery?("DNS_QUERY [\(encoding.rawValue)]", queryName, transport)
         let ips = try await dnsQueryAAAA(name: queryName)
         let (responsePayload, _, _) = try AAAAEncoder.decode(ips)
         await rateLimiter.record(success: true)

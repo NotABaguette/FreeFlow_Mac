@@ -48,6 +48,13 @@ struct SettingsPanel: View {
                     Text("DNS AAAA (covert)").tag(false)
                     Text("HTTP Relay (faster)").tag(true)
                 }
+                if !state.useRelayHTTP {
+                    Picker("DNS Encoding", selection: $state.queryEncoding) {
+                        Text("Proquint (censored networks)").tag("proquint")
+                        Text("Hex (uncensored)").tag("hex")
+                        Text("Lexical (legacy)").tag("lexical")
+                    }
+                }
                 if state.useRelayHTTP {
                     TextField("Relay URL", text: $state.relayURL)
                         .font(.system(.body, design: .monospaced))

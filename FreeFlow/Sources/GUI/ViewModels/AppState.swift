@@ -39,6 +39,7 @@ class AppState: ObservableObject {
     @Published var useDNSOverHTTPS: Bool = false
 
     // Transport
+    @Published var queryEncoding: String = "proquint"  // "proquint", "hex", "lexical"
     @Published var useRelayHTTP: Bool = false
     @Published var relayURL: String = "https://oracle.example.com:8443"
     @Published var relayAPIKey: String = ""
@@ -129,6 +130,13 @@ class AppState: ObservableObject {
         conn.relayURL = relayURL
         conn.relayAPIKey = relayAPIKey
         conn.relayAllowInsecure = relayAllowInsecure
+
+        // Set encoding mode
+        switch queryEncoding {
+        case "hex": conn.encoding = .hex
+        case "lexical": conn.encoding = .lexical
+        default: conn.encoding = .proquint
+        }
 
         // Wire up dev logging
         conn.onQuery = { [weak self] query, response, transport in
@@ -568,6 +576,7 @@ class AppState: ObservableObject {
             "relayURL": relayURL,
             "relayAPIKey": relayAPIKey,
             "relayAllowInsecure": relayAllowInsecure,
+            "queryEncoding": queryEncoding,
             "skipAutoTune": skipAutoTune,
             "manualDelay": manualDelay,
         ]
@@ -594,6 +603,7 @@ class AppState: ObservableObject {
         relayURL = dict["relayURL"] as? String ?? relayURL
         relayAPIKey = dict["relayAPIKey"] as? String ?? ""
         relayAllowInsecure = dict["relayAllowInsecure"] as? Bool ?? false
+        queryEncoding = dict["queryEncoding"] as? String ?? "proquint"
         skipAutoTune = dict["skipAutoTune"] as? Bool ?? false
         manualDelay = dict["manualDelay"] as? Double ?? 3.0
     }
