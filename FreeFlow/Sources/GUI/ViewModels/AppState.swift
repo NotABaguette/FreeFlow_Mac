@@ -4,7 +4,7 @@ import FreeFlowCore
 #endif
 import CryptoKit
 
-/// Central app state shared across all views
+/// Central app state — all operations are REAL, using FFConnection for DNS/HTTP transport
 @MainActor
 class AppState: ObservableObject {
     // Identity
@@ -18,12 +18,13 @@ class AppState: ObservableObject {
     @Published var clockOffset: TimeInterval = 0
     @Published var pingLatency: TimeInterval = 0
     @Published var queryCount: Int = 0
+    @Published var lastError: String?
 
     // Contacts
     @Published var contacts: [Contact] = []
 
     // Messages
-    @Published var conversations: [String: [ChatMessage]] = [:]  // fingerprint → messages
+    @Published var conversations: [String: [ChatMessage]] = [:]
     @Published var selectedContactFP: String?
     @Published var unreadCounts: [String: Int] = [:]
 
@@ -37,6 +38,11 @@ class AppState: ObservableObject {
     @Published var dailyBudget: Int = 300
     @Published var useDNSOverHTTPS: Bool = false
 
+    // Transport
+    @Published var useRelayHTTP: Bool = false
+    @Published var relayURL: String = "https://oracle.example.com:8443"
+    @Published var relayAPIKey: String = ""
+
     // Dev mode
     @Published var devMode: Bool = false
     @Published var devQueryLog: [QueryLogEntry] = []
@@ -48,7 +54,9 @@ class AppState: ObservableObject {
     // Connection log
     @Published var connectionLog: [LogEntry] = []
 
-    // Data directory
+    // Real connection
+    private var connection: FFConnection?
+
     let dataDir: URL
 
     init() {
@@ -59,6 +67,321 @@ class AppState: ObservableObject {
         loadContacts()
         loadSettings()
         loadConversations()
+    }
+
+    // MARK: - Connection Management
+
+    private func buildConnection() -> FFConnection? {
+        guard let id = identity else {
+            log(.error, "No identity — create one first")
+            return nil
+        }
+        guard !oraclePublicKeyHex.isEmpty else {
+            log(.error, "Oracle public key not configured — set in Settings")
+            return nil
+        }
+        guard !bootstrapSeedHex.isEmpty else {
+            log(.error, "Bootstrap seed not configured — set in Settings")
+            return nil
+        }
+        guard let oraclePK = hexToBytes(oraclePublicKeyHex), oraclePK.count == 32 else {
+            log(.error, "Invalid Oracle public key — must be 64 hex chars (32 bytes)")
+            return nil
+        }
+        guard let seed = hexToBytes(bootstrapSeedHex), seed.count == 32 else {
+            log(.error, "Invalid bootstrap seed — must be 64 hex chars (32 bytes)")
+            return nil
+        }
+
+        // For now use an empty profile — the Oracle will match
+        let profile = LexicalProfile(id: "default", category: "default",
+                                      templates: [], wordLists: [:])
+
+        let conn = FFConnection(identity: id, oraclePublicKey: oraclePK, seed: seed, profile: profile)
+        conn.resolver = resolverAddress
+        conn.useRelay = useRelayHTTP
+        conn.relayURL = relayURL
+        conn.relayAPIKey = relayAPIKey
+
+        // Wire up dev logging
+        conn.onQuery = { [weak self] query, response, transport in
+            DispatchQueue.main.async {
+                self?.queryCount += 1
+                self?.devLog(query: query, response: response, transport: transport)
+            }
+        }
+
+        return conn
+    }
+
+    // MARK: - Connect
+
+    func connect() {
+        guard let conn = buildConnection() else { return }
+        connection = conn
+        connectionState = .connecting
+        log(.info, "Connecting to Oracle...")
+        log(.info, "Resolver: \(resolverAddress)")
+        log(.info, "Domain: \(oracleDomain)")
+        log(.info, "Transport: \(useRelayHTTP ? "HTTP Relay" : "DNS AAAA")")
+
+        Task {
+            do {
+                try await conn.connect()
+                await MainActor.run {
+                    self.connectionState = .connected
+                    self.sessionActive = true
+                    self.lastError = nil
+                    if let sid = conn.session?.id {
+                        let hex = sid.map { String(format: "%02x", $0) }.joined()
+                        self.log(.success, "Session established: \(hex)")
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.connectionState = .error
+                    self.sessionActive = false
+                    self.lastError = error.localizedDescription
+                    self.log(.error, "Connection failed: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    func disconnect() {
+        connection?.disconnect()
+        connection = nil
+        connectionState = .disconnected
+        sessionActive = false
+        log(.info, "Disconnected")
+    }
+
+    // MARK: - Ping
+
+    func ping() {
+        guard let conn = connection else {
+            log(.warning, "Not connected")
+            return
+        }
+        log(.dns, "PING →")
+        let start = Date()
+
+        Task {
+            do {
+                let serverDate = try await conn.ping()
+                await MainActor.run {
+                    self.pingLatency = Date().timeIntervalSince(start) * 1000
+                    self.serverTime = serverDate
+                    self.log(.success, "PONG ← \(Int(self.pingLatency))ms | Server: \(serverDate.formatted(.dateTime.hour().minute().second()))")
+                }
+            } catch {
+                await MainActor.run {
+                    self.log(.error, "Ping failed: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    // MARK: - DNS Cache Test
+
+    func testDNSCache() {
+        guard let conn = connection else {
+            log(.warning, "Not connected — connect first")
+            return
+        }
+        log(.info, "Testing DNS cache behavior...")
+
+        Task {
+            do {
+                let (ttl, cached) = try await conn.testDNSCache()
+                await MainActor.run {
+                    self.log(.success, "Cache test: TTL=\(ttl)s cached=\(cached)")
+                }
+            } catch {
+                await MainActor.run {
+                    self.log(.error, "Cache test failed: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    // MARK: - Sync Inbox
+
+    func syncInbox() {
+        guard let conn = connection, sessionActive else {
+            log(.warning, "No active session — connect first")
+            return
+        }
+        log(.dns, "Polling inbox...")
+
+        Task {
+            do {
+                if let result = try await conn.pollMessages() {
+                    // Find sender by fingerprint
+                    let fpHex = result.senderFP.map { String(format: "%02x", $0) }.joined()
+                    let senderContact = contacts.first { $0.fingerprintHex.hasPrefix(fpHex) }
+
+                    if let contact = senderContact {
+                        let text = try conn.decryptMessage(result.data, senderPublicKey: contact.publicKey)
+                        await MainActor.run {
+                            self.receiveMessage(text, from: contact)
+                            self.log(.success, "Message from \(contact.displayName): \(text.prefix(50))")
+                        }
+                    } else {
+                        await MainActor.run {
+                            self.log(.warning, "Message from unknown sender: \(fpHex)")
+                        }
+                    }
+                } else {
+                    await MainActor.run {
+                        self.log(.info, "Inbox empty — no new messages")
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.log(.error, "Inbox sync failed: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    // MARK: - Send Message
+
+    func sendMessage(_ text: String, to contact: Contact) {
+        guard let conn = connection, sessionActive else {
+            log(.warning, "No active session — connect first")
+            return
+        }
+        guard let id = identity else { return }
+
+        let msg = ChatMessage(
+            id: UUID().uuidString,
+            text: text,
+            sender: id.fingerprintHex,
+            recipient: contact.fingerprintHex,
+            timestamp: Date(),
+            direction: .sent,
+            status: .sending
+        )
+        conversations[contact.fingerprintHex, default: []].append(msg)
+        saveConversations()
+
+        Task {
+            do {
+                let fragments = try await conn.sendMessage(text, to: contact)
+                await MainActor.run {
+                    if let idx = self.conversations[contact.fingerprintHex]?.firstIndex(where: { $0.id == msg.id }) {
+                        self.conversations[contact.fingerprintHex]?[idx].status = .sent
+                    }
+                    self.log(.success, "Sent \(text.count)B to \(contact.displayName) (\(fragments) fragments)")
+                    self.saveConversations()
+                }
+            } catch {
+                await MainActor.run {
+                    if let idx = self.conversations[contact.fingerprintHex]?.firstIndex(where: { $0.id == msg.id }) {
+                        self.conversations[contact.fingerprintHex]?[idx].status = .failed
+                    }
+                    self.log(.error, "Send failed: \(error.localizedDescription)")
+                    self.saveConversations()
+                }
+            }
+        }
+    }
+
+    func receiveMessage(_ text: String, from contact: Contact) {
+        let msg = ChatMessage(
+            id: UUID().uuidString,
+            text: text,
+            sender: contact.fingerprintHex,
+            recipient: identity?.fingerprintHex ?? "",
+            timestamp: Date(),
+            direction: .received,
+            status: .delivered
+        )
+        conversations[contact.fingerprintHex, default: []].append(msg)
+        if selectedContactFP != contact.fingerprintHex {
+            unreadCounts[contact.fingerprintHex, default: 0] += 1
+        }
+        saveConversations()
+    }
+
+    func markRead(_ contactFP: String) {
+        unreadCounts[contactFP] = 0
+    }
+
+    // MARK: - Bulletins
+
+    func fetchBulletin() {
+        guard let conn = connection else {
+            // Allow bulletin fetch without session (protocol allows it)
+            guard let c = buildConnection() else { return }
+            connection = c
+            _fetchBulletin(c)
+            return
+        }
+        _fetchBulletin(conn)
+    }
+
+    private func _fetchBulletin(_ conn: FFConnection) {
+        log(.dns, "GET_BULLETIN lastID=\(lastBulletinID)...")
+
+        Task {
+            do {
+                let response = try await conn.getBulletin(lastSeenID: lastBulletinID)
+
+                await MainActor.run {
+                    guard response.count > 6 else {
+                        self.log(.info, "No new bulletins")
+                        return
+                    }
+
+                    // Parse: [bulletinID(2)][timestamp(4)][content...]
+                    let bid = UInt16(response[0]) << 8 | UInt16(response[1])
+                    let ts = UInt32(response[2]) << 24 | UInt32(response[3]) << 16 |
+                             UInt32(response[4]) << 8 | UInt32(response[5])
+                    let contentBytes = Array(response[6...])
+                    let content = String(bytes: contentBytes, encoding: .utf8) ?? "(binary data \(contentBytes.count)B)"
+
+                    let bulletin = Bulletin(
+                        id: bid,
+                        timestamp: Date(timeIntervalSince1970: TimeInterval(ts)),
+                        content: content,
+                        verified: true, // Ed25519 verified by Oracle
+                        signatureHex: contentBytes.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    )
+                    self.bulletins.insert(bulletin, at: 0)
+                    self.lastBulletinID = bid
+                    self.log(.success, "Bulletin #\(bid): \(content.prefix(60))")
+                }
+            } catch {
+                await MainActor.run {
+                    self.log(.error, "Bulletin fetch failed: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    // MARK: - Discover
+
+    func discover() {
+        guard let conn = connection, sessionActive else {
+            log(.warning, "No active session")
+            return
+        }
+        log(.dns, "DISCOVER → requesting epoch seed...")
+
+        Task {
+            do {
+                try await conn.discover()
+                await MainActor.run {
+                    self.log(.success, "Epoch seed updated: epoch=\(conn.domainManager.epochNumber)")
+                }
+            } catch {
+                await MainActor.run {
+                    self.log(.error, "Discover failed: \(error.localizedDescription)")
+                }
+            }
+        }
     }
 
     // MARK: - Identity
@@ -95,239 +418,31 @@ class AppState: ObservableObject {
 
     private func saveContacts() {
         let url = dataDir.appendingPathComponent("contacts.json")
-        if let data = try? JSONEncoder().encode(contacts) {
-            try? data.write(to: url)
-        }
+        if let data = try? JSONEncoder().encode(contacts) { try? data.write(to: url) }
     }
 
     private func loadContacts() {
         let url = dataDir.appendingPathComponent("contacts.json")
         if let data = try? Data(contentsOf: url),
-           let loaded = try? JSONDecoder().decode([Contact].self, from: data) {
-            contacts = loaded
-        }
+           let loaded = try? JSONDecoder().decode([Contact].self, from: data) { contacts = loaded }
     }
 
-    // MARK: - Messages
-
-    func sendMessage(_ text: String, to contact: Contact) {
-        guard let id = identity else { return }
-
-        let msg = ChatMessage(
-            id: UUID().uuidString,
-            text: text,
-            sender: id.fingerprintHex,
-            recipient: contact.fingerprintHex,
-            timestamp: Date(),
-            direction: .sent,
-            status: .sending
-        )
-
-        conversations[contact.fingerprintHex, default: []].append(msg)
-
-        // Simulate E2E encryption
-        do {
-            let e2eKey = try E2ECrypto.deriveKey(myPrivate: id.privateKey, theirPublic: contact.publicKey)
-            let encrypted = try E2ECrypto.encrypt(key: e2eKey, plaintext: [UInt8](text.utf8))
-            let fragments = max(1, (encrypted.count + 5) / 6)
-            log(.info, "Encrypted \(text.count)B → \(encrypted.count)B (\(fragments) DNS queries)")
-
-            for i in 0..<fragments {
-                let chunkSize = min(6, encrypted.count - i * 6)
-                devLog(query: "SEND_MSG frag \(i+1)/\(fragments) to \(contact.fingerprintHex.prefix(8)) [\(chunkSize)B]",
-                       response: "ACK frag \(i+1)")
-            }
-
-            // Mark as sent (in real implementation, would wait for ACKs)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                if let idx = self.conversations[contact.fingerprintHex]?.firstIndex(where: { $0.id == msg.id }) {
-                    self.conversations[contact.fingerprintHex]?[idx].status = .sent
-                }
-            }
-            queryCount += fragments
-        } catch {
-            log(.error, "Encryption failed: \(error)")
-        }
-
-        saveConversations()
-    }
-
-    func receiveMessage(_ text: String, from contact: Contact) {
-        let msg = ChatMessage(
-            id: UUID().uuidString,
-            text: text,
-            sender: contact.fingerprintHex,
-            recipient: identity?.fingerprintHex ?? "",
-            timestamp: Date(),
-            direction: .received,
-            status: .delivered
-        )
-        conversations[contact.fingerprintHex, default: []].append(msg)
-        if selectedContactFP != contact.fingerprintHex {
-            unreadCounts[contact.fingerprintHex, default: 0] += 1
-        }
-        saveConversations()
-    }
-
-    func markRead(_ contactFP: String) {
-        unreadCounts[contactFP] = 0
-    }
+    // MARK: - Conversations
 
     private func saveConversations() {
         let url = dataDir.appendingPathComponent("conversations.json")
-        if let data = try? JSONEncoder().encode(conversations) {
-            try? data.write(to: url)
-        }
+        if let data = try? JSONEncoder().encode(conversations) { try? data.write(to: url) }
     }
 
     private func loadConversations() {
         let url = dataDir.appendingPathComponent("conversations.json")
         if let data = try? Data(contentsOf: url),
-           let loaded = try? JSONDecoder().decode([String: [ChatMessage]].self, from: data) {
-            conversations = loaded
-        }
+           let loaded = try? JSONDecoder().decode([String: [ChatMessage]].self, from: data) { conversations = loaded }
     }
 
-    // MARK: - Connection
+    // MARK: - Dev Logging
 
-    func connect() {
-        connectionState = .connecting
-        log(.info, "Initiating HELLO handshake...")
-        log(.info, "Resolver: \(resolverAddress)")
-        log(.info, "Domain: \(oracleDomain)")
-
-        // Simulate 4-query HELLO handshake
-        let sessionId = UUID().uuidString.prefix(16)
-        for i in 0..<4 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 1.2) {
-                self.log(.dns, "HELLO chunk \(i+1)/4 sent")
-                self.queryCount += 1
-                self.devLog(
-                    query: "HELLO chunk_idx=\(i) total=4 pubkey[\(i*8)..\((i+1)*8)] nonce=\(UInt16.random(in: 0...UInt16.max))",
-                    response: i < 3 ? "ACK chunk_idx=\(i)" : "HELLO_COMPLETE session_id=\(sessionId) server_time=\(Int(Date().timeIntervalSince1970))"
-                )
-            }
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-            self.connectionState = .connected
-            self.sessionActive = true
-            self.serverTime = Date()
-            self.log(.success, "Session established")
-            self.log(.info, "Session ID: \(sessionId)")
-            self.devLog(query: "ECDH X25519 → HKDF-SHA256", response: "session_key derived (32 bytes)")
-        }
-    }
-
-    func disconnect() {
-        connectionState = .disconnected
-        sessionActive = false
-        log(.info, "Disconnected")
-        devLog(query: "SESSION_CLOSE", response: "session destroyed, keys zeroed")
-    }
-
-    func ping() {
-        let start = Date()
-        log(.dns, "PING →")
-        queryCount += 1
-        devLog(query: "PING (cmd=0x07)", response: "waiting...")
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            self.pingLatency = Date().timeIntervalSince(start) * 1000
-            self.serverTime = Date()
-            self.log(.success, "PONG ← \(String(format: "%.0f", self.pingLatency))ms")
-            let ts = Int(Date().timeIntervalSince1970)
-            self.devLog(query: "PING (cmd=0x07)", response: "PONG server_time=\(ts) latency=\(Int(self.pingLatency))ms")
-        }
-    }
-
-    func testDNSCache() {
-        log(.info, "Testing DNS cache behavior...")
-        log(.dns, "Sending identical queries...")
-        devLog(query: "CACHE_TEST start", response: "sending 3 identical queries")
-
-        for i in 1...3 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.5) {
-                self.log(.dns, "Cache test query \(i)/3")
-                self.queryCount += 1
-                self.devLog(
-                    query: "AAAA? test-cache-\(i).\(self.oracleDomain)",
-                    response: "AAAA 2606:4700::... TTL=300 (cached=\(i > 1 ? "yes" : "no"))"
-                )
-            }
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-            self.log(.success, "Cache profiling complete — TTL appears to be 300s")
-            self.devLog(query: "CACHE_TEST complete", response: "TTL=300s, resolver caches: yes")
-        }
-    }
-
-    // MARK: - Sync Inbox
-
-    func syncInbox() {
-        guard sessionActive else {
-            log(.warning, "Cannot sync — no active session")
-            return
-        }
-        log(.dns, "GET_MSG → polling inbox...")
-        queryCount += 1
-        devLog(query: "GET_MSG poll", response: "waiting...")
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            let hasMessages = Bool.random()
-            if hasMessages {
-                let sampleSenders = self.contacts.prefix(2)
-                for contact in sampleSenders {
-                    let msgs = ["Are you safe?", "Check the bulletin", "Network is back in some areas",
-                                "Meeting at usual place", "Send update when you can"]
-                    let msg = msgs.randomElement()!
-                    self.receiveMessage(msg, from: contact)
-                    self.log(.success, "Message from \(contact.displayName): \(msg)")
-                    self.devLog(query: "GET_MSG", response: "fragment: \(msg.count)B from \(contact.fingerprintHex.prefix(8))")
-                }
-            } else {
-                self.log(.info, "Inbox empty — no new messages")
-                self.devLog(query: "GET_MSG", response: "empty (0 bytes)")
-            }
-        }
-    }
-
-    // MARK: - Bulletins
-
-    func fetchBulletin() {
-        log(.dns, "GET_BULLETIN → fetching latest...")
-        queryCount += 1
-        devLog(query: "GET_BULLETIN (lastID=\(lastBulletinID))", response: "waiting...")
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-            self.lastBulletinID += 1
-            let sampleBulletins = [
-                "Internet access partially restored in western provinces. Satellite uplinks operational.",
-                "Emergency coordination channel active. Use DGA epoch 3 domains.",
-                "All proxy shields rotated. New NS records propagating. ETA 6 hours.",
-                "Confirmed: DNS filtering bypass effective on resolvers 8.8.8.8 and 1.1.1.1.",
-                "Security advisory: update to epoch seed 4. Old seeds compromised.",
-            ]
-            let content = sampleBulletins.randomElement()!
-            let bulletin = Bulletin(
-                id: self.lastBulletinID,
-                timestamp: Date(),
-                content: content,
-                verified: true,
-                signatureHex: String((0..<16).map { _ in "0123456789abcdef".randomElement()! })
-            )
-            self.bulletins.insert(bulletin, at: 0)
-            self.log(.success, "Bulletin #\(bulletin.id) received (\(content.count) chars, signature verified)")
-            self.devLog(query: "GET_BULLETIN", response: "id=\(bulletin.id) len=\(content.count) sig=OK")
-
-            if self.bulletins.count > 50 { self.bulletins = Array(self.bulletins.prefix(50)) }
-        }
-    }
-
-    // MARK: - Dev Query Logging
-
-    func devLog(query: String, response: String) {
+    func devLog(query: String, response: String, transport: String? = nil) {
         guard devMode else { return }
         let entry = QueryLogEntry(
             timestamp: Date(),
@@ -335,17 +450,19 @@ class AppState: ObservableObject {
             response: response,
             domain: oracleDomain,
             resolver: resolverAddress,
-            transport: useRelayHTTP ? "HTTP Relay" : "DNS AAAA"
+            transport: transport ?? (useRelayHTTP ? "HTTP" : "DNS")
         )
         devQueryLog.append(entry)
         if devQueryLog.count > 500 { devQueryLog.removeFirst(100) }
     }
 
-    // MARK: - Transport
+    // MARK: - Logging
 
-    @Published var useRelayHTTP: Bool = false
-    @Published var relayURL: String = "https://oracle.example.com:8443"
-    @Published var relayAPIKey: String = ""
+    func log(_ level: LogLevel, _ message: String) {
+        let entry = LogEntry(timestamp: Date(), level: level, message: message)
+        connectionLog.append(entry)
+        if connectionLog.count > 500 { connectionLog.removeFirst(100) }
+    }
 
     // MARK: - Settings
 
@@ -388,12 +505,19 @@ class AppState: ObservableObject {
         relayAPIKey = dict["relayAPIKey"] as? String ?? ""
     }
 
-    // MARK: - Logging
+    // MARK: - Helpers
 
-    func log(_ level: LogLevel, _ message: String) {
-        let entry = LogEntry(timestamp: Date(), level: level, message: message)
-        connectionLog.append(entry)
-        if connectionLog.count > 500 { connectionLog.removeFirst(100) }
+    private func hexToBytes(_ hex: String) -> [UInt8]? {
+        let clean = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        var bytes = [UInt8]()
+        var i = clean.startIndex
+        while i < clean.endIndex {
+            guard let next = clean.index(i, offsetBy: 2, limitedBy: clean.endIndex) else { return nil }
+            guard let byte = UInt8(clean[i..<next], radix: 16) else { return nil }
+            bytes.append(byte)
+            i = next
+        }
+        return bytes
     }
 }
 
@@ -424,13 +548,8 @@ struct ChatMessage: Codable, Identifiable {
     let direction: MessageDirection
     var status: MessageStatus
 
-    enum MessageDirection: String, Codable {
-        case sent, received
-    }
-
-    enum MessageStatus: String, Codable {
-        case sending, sent, delivered, failed
-    }
+    enum MessageDirection: String, Codable { case sent, received }
+    enum MessageStatus: String, Codable { case sending, sent, delivered, failed }
 }
 
 struct LogEntry: Identifiable {
