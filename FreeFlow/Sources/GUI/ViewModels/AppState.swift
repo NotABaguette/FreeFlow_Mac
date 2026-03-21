@@ -148,6 +148,21 @@ class AppState: ObservableObject {
 
         Task {
             do {
+                // Auto-tune TTL first (unless using HTTP relay)
+                if !conn.useRelay {
+                    await MainActor.run { self.log(.info, "Auto-tuning resolver cache TTL...") }
+                    do {
+                        let (ttl, delay) = try await conn.autoTuneTTL()
+                        await MainActor.run {
+                            self.log(.success, "Auto-tune: optimal TTL=\(ttl), delay=\(delay)s")
+                        }
+                    } catch {
+                        await MainActor.run {
+                            self.log(.warning, "Auto-tune failed, using default 3s delay: \(error.localizedDescription)")
+                        }
+                    }
+                }
+
                 try await conn.connect()
                 await MainActor.run {
                     self.connectionState = .connected
@@ -157,6 +172,7 @@ class AppState: ObservableObject {
                         let hex = sid.map { String(format: "%02x", $0) }.joined()
                         self.log(.success, "Session established: \(hex)")
                     }
+                    self.log(.info, "Query delay: \(conn.optimalDelay)s")
                 }
             } catch {
                 await MainActor.run {

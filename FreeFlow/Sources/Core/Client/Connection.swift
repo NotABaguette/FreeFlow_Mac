@@ -80,7 +80,7 @@ public class FFConnection: ObservableObject {
                 onQuery?("HELLO_COMPLETE", "session_id=\(sidHex) key_derived=32B", transport)
             } else {
                 onQuery?("HELLO chunk=\(i)/4", "ACK chunk_idx=\(i)", transport)
-                try await rateLimiter.waitForNext()
+                try await Task.sleep(nanoseconds: UInt64(optimalDelay * 1_000_000_000))
             }
         }
     }
@@ -137,7 +137,7 @@ public class FFConnection: ObservableObject {
 
         let fpHex = contact.fingerprintHex.prefix(8)
         for (i, fragment) in fragments.enumerated() {
-            try await rateLimiter.waitForNext()
+            try await Task.sleep(nanoseconds: UInt64(optimalDelay * 1_000_000_000))
             let seq = sess.nextSeqNo()
             let token = sess.token(for: seq)
 
@@ -160,7 +160,7 @@ public class FFConnection: ObservableObject {
     public func pollMessages() async throws -> (data: [UInt8], senderFP: [UInt8])? {
         guard let sess = session else { throw FFError.noSession }
 
-        try await rateLimiter.waitForNext()
+        try await Task.sleep(nanoseconds: UInt64(optimalDelay * 1_000_000_000))
         let seq = sess.nextSeqNo()
         let token = sess.token(for: seq)
 
@@ -217,27 +217,84 @@ public class FFConnection: ObservableObject {
         }
     }
 
-    // MARK: - DNS CACHE TEST
+    // MARK: - DNS CACHE TEST & AUTO-TUNING
 
+    /// Optimal delay between queries (auto-tuned by cache test)
+    public var optimalDelay: TimeInterval = 3.0
+
+    /// Run Oracle's _ct cache test protocol to find the real resolver TTL
+    /// Uses the Oracle's atomic counter: same counter = cached, different = fresh
+    /// Tests TTLs: 0, 1, 2, 3, 5, 10 to find the sweet spot
+    public func autoTuneTTL() async throws -> (optimalTTL: Int, delay: TimeInterval) {
+        let domain = domainManager.activeDomain()
+        let testTTLs = [0, 1, 2, 3, 5, 10]
+        var results: [(ttl: Int, cached: Bool, counter1: UInt32, counter2: UInt32)] = []
+
+        onQuery?("AUTO_TUNE", "Starting cache profiling with \(testTTLs.count) TTL values...", transport)
+
+        for ttl in testTTLs {
+            let seq = UInt16.random(in: 0...UInt16.max)
+            let nonce1 = String((0..<6).map { _ in "abcdefghijklmnop".randomElement()! })
+            let nonce2 = String((0..<6).map { _ in "abcdefghijklmnop".randomElement()! })
+
+            // Query 1: _ct.<ttl>.<seq>.<nonce1>.<domain>
+            let qname1 = "_ct.\(ttl).\(seq).\(nonce1).\(domain)"
+            onQuery?("CACHE_TEST", "TTL=\(ttl) query 1: \(qname1)", transport)
+            let ips1 = try await dnsQueryAAAA(name: qname1)
+            let counter1 = extractCounter(from: ips1)
+
+            // Wait slightly longer than the TTL we're testing
+            let waitTime = max(TimeInterval(ttl) + 0.5, 1.0)
+            try await Task.sleep(nanoseconds: UInt64(waitTime * 1_000_000_000))
+
+            // Query 2: same _ct.<ttl>.<seq> but different nonce
+            // If resolver cached it, counter will be same (Oracle wasn't hit)
+            let qname2 = "_ct.\(ttl).\(seq).\(nonce2).\(domain)"
+            onQuery?("CACHE_TEST", "TTL=\(ttl) query 2: \(qname2)", transport)
+            let ips2 = try await dnsQueryAAAA(name: qname2)
+            let counter2 = extractCounter(from: ips2)
+
+            let cached = (counter1 == counter2)
+            results.append((ttl: ttl, cached: cached, counter1: counter1, counter2: counter2))
+
+            onQuery?("CACHE_TEST", "TTL=\(ttl): c1=\(counter1) c2=\(counter2) cached=\(cached)", transport)
+        }
+
+        // Find the minimum TTL where responses are NOT cached
+        // That's our sweet spot — smallest TTL the resolver respects
+        var bestTTL = 0
+        for r in results {
+            if !r.cached {
+                bestTTL = r.ttl
+                break
+            }
+        }
+
+        // If everything is cached (aggressive resolver), use TTL=0 with longer delays
+        if results.allSatisfy({ $0.cached }) {
+            bestTTL = 0
+            optimalDelay = 5.0  // Conservative
+            onQuery?("AUTO_TUNE", "Aggressive caching detected — using 5s delay", transport)
+        } else {
+            // Delay = TTL + 1 second safety margin
+            optimalDelay = max(TimeInterval(bestTTL) + 1.0, 2.0)
+            onQuery?("AUTO_TUNE", "Optimal: TTL=\(bestTTL) delay=\(optimalDelay)s", transport)
+        }
+
+        return (bestTTL, optimalDelay)
+    }
+
+    /// Simple cache test (non-auto-tuning, just checks if resolver caches)
     public func testDNSCache() async throws -> (ttl: Int, cached: Bool) {
-        // Send same query twice, compare timing
-        let payload: [UInt8] = [Command.ping.rawValue]
+        let result = try await autoTuneTTL()
+        return (result.optimalTTL, result.optimalTTL > 0)
+    }
 
-        let start1 = Date()
-        onQuery?("CACHE_TEST query 1/2", "sending...", transport)
-        _ = try await queryOracle(payload: payload)
-        let t1 = Date().timeIntervalSince(start1)
-
-        try await Task.sleep(nanoseconds: 500_000_000) // 0.5s
-
-        let start2 = Date()
-        onQuery?("CACHE_TEST query 2/2 (same query)", "sending...", transport)
-        _ = try await queryOracle(payload: payload)
-        let t2 = Date().timeIntervalSince(start2)
-
-        let cached = t2 < t1 * 0.5
-        onQuery?("CACHE_TEST", "t1=\(Int(t1*1000))ms t2=\(Int(t2*1000))ms cached=\(cached)", transport)
-        return (300, cached)
+    /// Extract the Oracle's atomic counter from a cache test AAAA response
+    /// Response format: [2001:0db8:<ttl>:<seq>:<counter_hi>:<counter_lo>:<ts_hi>:<ts_lo>]
+    private func extractCounter(from ips: [[UInt8]]) -> UInt32 {
+        guard let ip = ips.first, ip.count >= 12 else { return 0 }
+        return UInt32(ip[8]) << 24 | UInt32(ip[9]) << 16 | UInt32(ip[10]) << 8 | UInt32(ip[11])
     }
 
     // MARK: - Transport
