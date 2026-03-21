@@ -12,7 +12,10 @@ let package = Package(
     targets: [
         .target(
             name: "FreeFlowCore",
-            path: "FreeFlow/Sources/Core"
+            path: "FreeFlow/Sources/Core",
+            resources: [
+                .copy("Lexical/profiles"),
+            ]
         ),
         .executableTarget(
             name: "FreeFlowCLI",

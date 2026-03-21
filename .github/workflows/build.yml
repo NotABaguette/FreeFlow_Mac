@@ -97,41 +97,41 @@ jobs:
             exit 1
           fi
 
-      - name: Build CLI release
-        run: |
+          # Bundle lexical profiles inside .app
+          mkdir -p "artifacts/FreeFlow.app/Contents/Resources/profiles"
+          cp FreeFlow/Sources/Core/Lexical/profiles/*.json "artifacts/FreeFlow.app/Contents/Resources/profiles/"
+          echo "Bundled $(ls artifacts/FreeFlow.app/Contents/Resources/profiles/ | wc -l) lexical profiles"
+
+          # Bundle CLI inside .app too
           swift build -c release
-          cp .build/release/freeflow artifacts/freeflow
-          chmod +x artifacts/freeflow
+          mkdir -p "artifacts/FreeFlow.app/Contents/MacOS"
+          cp .build/release/freeflow "artifacts/FreeFlow.app/Contents/MacOS/freeflow-cli"
+          chmod +x "artifacts/FreeFlow.app/Contents/MacOS/freeflow-cli"
+          echo "CLI bundled inside .app"
 
       - name: Package artifacts
         run: |
           cd artifacts
+
+          # Verify app contents
+          echo "=== App contents ==="
+          find FreeFlow.app -type f | head -20
+          echo "=== Profiles ==="
+          ls FreeFlow.app/Contents/Resources/profiles/
+
+          # Single zip with everything
           ditto -c -k --sequesterRsrc --keepParent FreeFlow.app FreeFlow-macOS-universal.zip
-          tar czf freeflow-cli-macOS.tar.gz freeflow
-          shasum -a 256 FreeFlow-macOS-universal.zip freeflow-cli-macOS.tar.gz > checksums.txt
-          echo "{\"commit\": \"$GITHUB_SHA\", \"date\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > build-info.json
-          rm -rf FreeFlow.app freeflow
+          shasum -a 256 FreeFlow-macOS-universal.zip > checksums.txt
+          echo "{\"commit\": \"$GITHUB_SHA\", \"date\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"contents\": \"GUI app + CLI + 10 lexical profiles\"}" > build-info.json
+          rm -rf FreeFlow.app
           ls -la
 
-      - name: Upload GUI App
+      - name: Upload FreeFlow.app
         uses: actions/upload-artifact@v4
         with:
-          name: FreeFlow-macOS-app
-          path: artifacts/FreeFlow-macOS-universal.zip
-          retention-days: 90
-
-      - name: Upload CLI
-        uses: actions/upload-artifact@v4
-        with:
-          name: FreeFlow-macOS-cli
-          path: artifacts/freeflow-cli-macOS.tar.gz
-          retention-days: 90
-
-      - name: Upload checksums
-        uses: actions/upload-artifact@v4
-        with:
-          name: checksums
+          name: FreeFlow-macOS
           path: |
+            artifacts/FreeFlow-macOS-universal.zip
             artifacts/checksums.txt
             artifacts/build-info.json
           retention-days: 90

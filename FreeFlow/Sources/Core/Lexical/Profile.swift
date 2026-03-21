@@ -57,19 +57,46 @@ public struct LexicalProfile: Codable {
         return profile
     }
 
-    /// Load profiles bundled in the app
+    /// Load profiles bundled in the app or SPM module
     public static func loadBundled() -> [LexicalProfile] {
         var profiles = [LexicalProfile]()
-        guard let bundle = Bundle.main.urls(forResourcesWithExtension: "json", subdirectory: "profiles")
-                ?? Bundle.main.urls(forResourcesWithExtension: "json", subdirectory: nil) else {
-            return profiles
+
+        // Try SPM resource bundle first
+        #if SWIFT_PACKAGE
+        if let bundleURL = Bundle.module.url(forResource: "profiles", withExtension: nil) {
+            profiles = loadAll(from: bundleURL)
+            if !profiles.isEmpty { return profiles }
         }
-        for url in bundle {
-            if var profile = try? loadProfile(from: url) {
-                profile.buildReverseMaps()
-                profiles.append(profile)
+        // Also try individual files in module bundle
+        if let urls = Bundle.module.urls(forResourcesWithExtension: "json", subdirectory: "profiles") {
+            for url in urls {
+                if var p = try? loadProfile(from: url) { p.buildReverseMaps(); profiles.append(p) }
+            }
+            if !profiles.isEmpty { return profiles }
+        }
+        #endif
+
+        // Try main app bundle
+        let searchPaths: [URL?] = [
+            Bundle.main.url(forResource: "profiles", withExtension: nil),
+            Bundle.main.resourceURL?.appendingPathComponent("profiles"),
+            Bundle.main.resourceURL,
+        ]
+        for path in searchPaths {
+            if let p = path {
+                let loaded = loadAll(from: p)
+                if !loaded.isEmpty { return loaded }
             }
         }
+
+        // Try individual files in main bundle
+        if let urls = Bundle.main.urls(forResourcesWithExtension: "json", subdirectory: "profiles")
+                ?? Bundle.main.urls(forResourcesWithExtension: "json", subdirectory: nil) {
+            for url in urls {
+                if var p = try? loadProfile(from: url) { p.buildReverseMaps(); profiles.append(p) }
+            }
+        }
+
         return profiles
     }
 }
