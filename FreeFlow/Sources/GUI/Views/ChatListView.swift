@@ -13,6 +13,14 @@ struct ChatListView: View {
                     Text("Messages")
                         .font(.system(.headline, design: .monospaced))
                     Spacer()
+                    Button {
+                        state.syncInbox()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Sync Inbox")
+                    .disabled(!state.sessionActive)
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)

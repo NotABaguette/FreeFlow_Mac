@@ -44,6 +44,11 @@ class AppState: ObservableObject {
     @Published var relayAPIKey: String = ""
     @Published var relayAllowInsecure: Bool = false
 
+    // Auto-tune
+    @Published var skipAutoTune: Bool = false
+    @Published var manualDelay: Double = 3.0
+    @Published var cachedResolverProfiles: [String: ResolverProfile] = [:]  // resolver → profile
+
     // Dev mode
     @Published var devMode: Bool = false
     @Published var devQueryLog: [QueryLogEntry] = []
@@ -68,6 +73,7 @@ class AppState: ObservableObject {
         loadContacts()
         loadSettings()
         loadConversations()
+        loadResolverProfiles()
     }
 
     // MARK: - Connection Management
@@ -148,26 +154,70 @@ class AppState: ObservableObject {
 
         Task {
             do {
-                // Auto-tune TTL first (unless using HTTP relay)
-                if !conn.useRelay {
+                // Set query delay
+                if skipAutoTune {
+                    // User-provided manual delay
+                    conn.optimalDelay = manualDelay
+                    await MainActor.run {
+                        self.log(.info, "Using manual delay: \(self.manualDelay)s (auto-tune skipped)")
+                    }
+                } else if conn.useRelay {
+                    conn.optimalDelay = 0.5 // HTTP relay doesn't need DNS timing
+                    await MainActor.run { self.log(.info, "HTTP relay — using 0.5s delay") }
+                } else if let cached = cachedResolverProfiles[resolverAddress] {
+                    // Use cached profile for this resolver
+                    conn.optimalDelay = cached.delay
+                    await MainActor.run {
+                        self.log(.info, "Loaded cached profile for \(self.resolverAddress): TTL=\(cached.ttl) delay=\(cached.delay)s")
+                    }
+                } else {
+                    // Auto-tune
                     await MainActor.run { self.log(.info, "Auto-tuning resolver cache TTL...") }
                     do {
                         let (ttl, delay) = try await conn.autoTuneTTL()
                         await MainActor.run {
                             self.log(.success, "Auto-tune: optimal TTL=\(ttl), delay=\(delay)s")
+                            // Cache the result
+                            self.cachedResolverProfiles[self.resolverAddress] = ResolverProfile(
+                                resolver: self.resolverAddress, ttl: ttl, delay: delay, testedAt: Date()
+                            )
+                            self.saveResolverProfiles()
                         }
                     } catch {
                         await MainActor.run {
-                            self.log(.warning, "Auto-tune failed, using default 3s delay: \(error.localizedDescription)")
+                            self.log(.warning, "Auto-tune failed, using default 3s: \(error.localizedDescription)")
                         }
                     }
                 }
 
+                // HELLO handshake
                 try await conn.connect()
+
+                // Verify Oracle pubkey with a PING
+                await MainActor.run { self.log(.info, "Verifying Oracle identity...") }
+                do {
+                    let serverDate = try await conn.ping()
+                    await MainActor.run {
+                        self.log(.success, "Oracle verified — server time: \(serverDate.formatted(.dateTime.hour().minute().second()))")
+                    }
+                } catch {
+                    // PING failed after HELLO = wrong pubkey or broken session
+                    conn.disconnect()
+                    await MainActor.run {
+                        self.connectionState = .error
+                        self.sessionActive = false
+                        self.lastError = "Oracle pubkey verification failed — session key mismatch. Check your Oracle Public Key in Settings."
+                        self.log(.error, "PUBKEY MISMATCH: HELLO succeeded but PING failed. The Oracle Public Key you entered does not match the Oracle server.")
+                        self.log(.error, "Disconnected. Fix the Oracle Public Key in Settings and reconnect.")
+                    }
+                    return
+                }
+
                 await MainActor.run {
                     self.connectionState = .connected
                     self.sessionActive = true
                     self.lastError = nil
+                    self.serverTime = Date()
                     if let sid = conn.session?.id {
                         let hex = sid.map { String(format: "%02x", $0) }.joined()
                         self.log(.success, "Session established: \(hex)")
@@ -517,6 +567,9 @@ class AppState: ObservableObject {
             "useRelayHTTP": useRelayHTTP,
             "relayURL": relayURL,
             "relayAPIKey": relayAPIKey,
+            "relayAllowInsecure": relayAllowInsecure,
+            "skipAutoTune": skipAutoTune,
+            "manualDelay": manualDelay,
         ]
         let url = dataDir.appendingPathComponent("settings.json")
         if let data = try? JSONSerialization.data(withJSONObject: settings, options: .prettyPrinted) {
@@ -540,6 +593,31 @@ class AppState: ObservableObject {
         useRelayHTTP = dict["useRelayHTTP"] as? Bool ?? false
         relayURL = dict["relayURL"] as? String ?? relayURL
         relayAPIKey = dict["relayAPIKey"] as? String ?? ""
+        relayAllowInsecure = dict["relayAllowInsecure"] as? Bool ?? false
+        skipAutoTune = dict["skipAutoTune"] as? Bool ?? false
+        manualDelay = dict["manualDelay"] as? Double ?? 3.0
+    }
+
+    // MARK: - Resolver Profiles
+
+    func saveResolverProfiles() {
+        let url = dataDir.appendingPathComponent("resolver_profiles.json")
+        let profiles = Array(cachedResolverProfiles.values)
+        if let data = try? JSONEncoder().encode(profiles) { try? data.write(to: url) }
+    }
+
+    private func loadResolverProfiles() {
+        let url = dataDir.appendingPathComponent("resolver_profiles.json")
+        guard let data = try? Data(contentsOf: url),
+              let profiles = try? JSONDecoder().decode([ResolverProfile].self, from: data) else { return }
+        for p in profiles {
+            cachedResolverProfiles[p.resolver] = p
+        }
+    }
+
+    func clearResolverProfile(for resolver: String) {
+        cachedResolverProfiles.removeValue(forKey: resolver)
+        saveResolverProfiles()
     }
 
     // MARK: - Helpers
@@ -636,4 +714,11 @@ struct QueryLogEntry: Identifiable {
     let domain: String
     let resolver: String
     let transport: String
+}
+
+struct ResolverProfile: Codable {
+    let resolver: String
+    let ttl: Int
+    let delay: TimeInterval
+    let testedAt: Date
 }

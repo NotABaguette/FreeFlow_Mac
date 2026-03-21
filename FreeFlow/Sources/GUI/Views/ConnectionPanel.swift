@@ -71,16 +71,6 @@ struct ConnectionPanel: View {
                             .buttonStyle(.bordered)
 
                             Button {
-                                state.syncInbox()
-                            } label: {
-                                Label("Sync Inbox", systemImage: "envelope.arrow.triangle.branch")
-                                    .frame(maxWidth: .infinity)
-                            }
-                            .controlSize(.large)
-                            .buttonStyle(.bordered)
-                            .disabled(!state.sessionActive)
-
-                            Button {
                                 state.testDNSCache()
                             } label: {
                                 Label("Cache Test", systemImage: "cylinder")
@@ -88,6 +78,46 @@ struct ConnectionPanel: View {
                             }
                             .controlSize(.large)
                             .buttonStyle(.bordered)
+
+                            Button {
+                                state.discover()
+                            } label: {
+                                Label("Discover", systemImage: "arrow.triangle.2.circlepath")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .controlSize(.large)
+                            .buttonStyle(.bordered)
+                            .disabled(!state.sessionActive)
+                        }
+
+                        // Auto-tune bypass
+                        HStack {
+                            Toggle("Skip auto-tune", isOn: $state.skipAutoTune)
+                                .toggleStyle(.checkbox)
+                            if state.skipAutoTune {
+                                HStack {
+                                    Text("Delay:")
+                                        .font(.system(.caption, design: .monospaced))
+                                    TextField("", value: $state.manualDelay, format: .number)
+                                        .textFieldStyle(.roundedBorder)
+                                        .frame(width: 50)
+                                    Text("sec")
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            if let profile = state.cachedResolverProfiles[state.resolverAddress] {
+                                Text("Cached: TTL=\(profile.ttl) delay=\(String(format: "%.1f", profile.delay))s")
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                Button("Clear") {
+                                    state.clearResolverProfile(for: state.resolverAddress)
+                                }
+                                .buttonStyle(.plain)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.red)
+                            }
                         }
 
                         // Transport + config
